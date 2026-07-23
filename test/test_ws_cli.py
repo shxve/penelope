@@ -51,6 +51,7 @@ def _reparse(args):
 	parser.add_argument("--ws", action="store_true")
 	parser.add_argument("--ws-path", type=str)
 	parser.add_argument("--ws-host", type=str)
+	parser.add_argument("--ws-backend", type=str)
 	parser.add_argument("--tls-cert", type=str)
 	parser.add_argument("--tls-key", type=str)
 	# ---
@@ -74,8 +75,13 @@ class TestWSOptionsPlumbing(unittest.TestCase):
 		self.assertFalse(opts.ws)
 		self.assertEqual(opts.ws_path, "/")
 		self.assertEqual(opts.ws_host, "")
+		self.assertEqual(opts.ws_backend, "")
 		self.assertEqual(opts.tls_cert, "")
 		self.assertEqual(opts.tls_key, "")
+
+	def test_ws_backend_lands_on_options(self):
+		opts = _reparse(["--ws", "--ws-backend", "https://decoy.example.com"])
+		self.assertEqual(opts.ws_backend, "https://decoy.example.com")
 
 	def test_ws_flag_flips_field(self):
 		opts = _reparse(["--ws"])

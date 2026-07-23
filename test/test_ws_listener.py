@@ -228,5 +228,153 @@ class TestWSListenerRejects(unittest.TestCase):
 			lst.close()
 
 
+# ---------------------------------------------------------------------------
+# --ws-backend decoy reverse-proxy
+# ---------------------------------------------------------------------------
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading as _thr
+
+
+class _DecoyHandler(BaseHTTPRequestHandler):
+	CANNED = b"<html><body>welcome to the decoy</body></html>"
+
+	def log_message(self, *a, **kw): pass  # silence
+
+	def do_GET(self):
+		self.send_response(200)
+		self.send_header("Content-Type", "text/html")
+		self.send_header("Content-Length", str(len(self.CANNED)))
+		# echo path back in a header so tests can assert it was preserved
+		self.send_header("X-Decoy-Path", self.path)
+		self.end_headers()
+		self.wfile.write(self.CANNED)
+
+
+class _DecoyServer:
+	def __init__(self):
+		self.srv = HTTPServer(("127.0.0.1", 0), _DecoyHandler)
+		self.url = "http://127.0.0.1:%d" % self.srv.server_address[1]
+		self.t = _thr.Thread(target=self.srv.serve_forever, daemon=True)
+		self.t.start()
+
+	def stop(self):
+		self.srv.shutdown()
+		self.srv.server_close()
+
+
+class TestWSListenerBackend(unittest.TestCase):
+
+	def setUp(self):
+		self.decoy = _DecoyServer()
+
+	def tearDown(self):
+		self.decoy.stop()
+
+	def _serve_one_expect_error(self, listener):
+		results = {}
+		def worker():
+			try:
+				listener.socket.settimeout(3.0)
+				raw, peer = listener.socket.accept()
+				listener.accept_ws(raw, peer)
+			except OSError as e:
+				results["err"] = str(e)
+		t = _thr.Thread(target=worker); t.start()
+		return t, results
+
+	def _http_get_full(self, host, port, req_bytes):
+		"""Return (status_line, headers_dict, body)."""
+		sock = socket.create_connection((host, port), timeout=3.0)
+		sock.sendall(req_bytes)
+		chunks = []
+		while True:
+			try:
+				chunk = sock.recv(4096)
+			except socket.timeout:
+				break
+			if not chunk:
+				break
+			chunks.append(chunk)
+			# stop as soon as we've read the whole response — the server
+			# sends Connection: close, but stop earlier if headers+body seen
+			if len(b"".join(chunks)) > 65536:
+				break
+		sock.close()
+		raw = b"".join(chunks)
+		head, _, body = raw.partition(b"\r\n\r\n")
+		status = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+		hdrs = {}
+		for line in head.split(b"\r\n")[1:]:
+			if b":" in line:
+				k, v = line.split(b":", 1)
+				hdrs[k.strip().decode("ascii").lower()] = v.strip().decode("iso-8859-1")
+		return status, hdrs, body
+
+	def test_non_ws_get_proxies_to_backend(self):
+		lst = WSListener(host="127.0.0.1", port=0, backend_url=self.decoy.url)
+		try:
+			t, _ = self._serve_one_expect_error(lst)
+			req = b"GET /some/api HTTP/1.1\r\nHost: cover.example.com\r\nUser-Agent: probe\r\n\r\n"
+			status, hdrs, body = self._http_get_full("127.0.0.1", lst.port, req)
+			self.assertIn("200", status)
+			self.assertIn(b"welcome to the decoy", body)
+			self.assertEqual(hdrs.get("x-decoy-path"), "/some/api")
+			t.join(timeout=3.0)
+		finally:
+			lst.close()
+
+	def test_wrong_path_falls_through_to_backend(self):
+		lst = WSListener(host="127.0.0.1", port=0, path="/expected",
+		                 backend_url=self.decoy.url)
+		try:
+			t, _ = self._serve_one_expect_error(lst)
+			# WS-shaped request but at the WRONG path → should be decoyed
+			req = (b"GET /wrong HTTP/1.1\r\n"
+			       b"Host: h\r\n"
+			       b"Upgrade: websocket\r\n"
+			       b"Connection: Upgrade\r\n"
+			       b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+			       b"Sec-WebSocket-Version: 13\r\n\r\n")
+			status, hdrs, body = self._http_get_full("127.0.0.1", lst.port, req)
+			self.assertIn("200", status)
+			self.assertIn(b"welcome", body)
+			self.assertEqual(hdrs.get("x-decoy-path"), "/wrong")
+			t.join(timeout=3.0)
+		finally:
+			lst.close()
+
+	def test_ws_upgrade_still_wins_when_backend_configured(self):
+		if websockets is None:
+			self.skipTest("websockets library not installed")
+		lst = WSListener(host="127.0.0.1", port=0, backend_url=self.decoy.url)
+		results = {}
+
+		def worker():
+			try:
+				lst.socket.settimeout(3.0)
+				raw, peer = lst.socket.accept()
+				conn = lst.accept_ws(raw, peer)
+				results["ok"] = True
+				# just close; client only cares that handshake completed
+				conn.close()
+			except Exception as e:
+				results["err"] = str(e)
+
+		try:
+			t = _thr.Thread(target=worker); t.start()
+
+			async def probe():
+				async with websockets.connect("ws://127.0.0.1:%d/" % lst.port,
+				                              open_timeout=3.0) as ws:
+					pass
+
+			asyncio.run(asyncio.wait_for(probe(), timeout=5.0))
+			t.join(timeout=3.0)
+			self.assertTrue(results.get("ok"), "server: %r" % results.get("err"))
+		finally:
+			lst.close()
+
+
 if __name__ == "__main__":
 	unittest.main(verbosity=2)

@@ -2730,12 +2730,13 @@ class WSListener:
 	referenced by the wiring commit.
 	"""
 
-	def __init__(self, host, port, path="/", host_pattern=None, tls_ctx=None):
+	def __init__(self, host, port, path="/", host_pattern=None, tls_ctx=None, backend_url=None):
 		self.host = host
 		self.port = port
 		self.path = path
 		self.host_pattern = host_pattern  # None or a compiled re.Pattern
 		self.tls_ctx = tls_ctx            # None or an ssl.SSLContext
+		self.backend_url = backend_url    # None or "https://decoy.example.com"; forwarded on non-WS requests
 		self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 		self.socket.bind((host, port))
@@ -2828,25 +2829,35 @@ class WSListener:
 			except OSError:
 				pass
 			raise
+		# Any request that isn't a well-formed WS upgrade at the expected
+		# path/Host either gets forwarded to the decoy backend (so the
+		# port looks like a normal web server to internet scanners) or
+		# receives a plain HTTP error.
+		def _decoy_or_deny(status, reason):
+			if self.backend_url:
+				try:
+					self._proxy_to_backend(raw_sock, method, path, headers, leftover)
+				except Exception as e:
+					logger.debug("ws-backend proxy failed: %s" % e)
+			else:
+				self._deny(raw_sock, status)
+			try:
+				raw_sock.close()
+			except OSError:
+				pass
+			raise OSError(reason)
+
 		if method != "GET":
-			self._deny(raw_sock, "405 Method Not Allowed")
-			raw_sock.close()
-			raise OSError("bad method %s" % method)
+			return _decoy_or_deny("405 Method Not Allowed", "bad method %s" % method)
 		if path != self.path:
-			self._deny(raw_sock, "404 Not Found")
-			raw_sock.close()
-			raise OSError("path mismatch %s" % path)
+			return _decoy_or_deny("404 Not Found", "path mismatch %s" % path)
 		if self.host_pattern is not None:
 			if not self.host_pattern.match(headers.get("host", "")):
-				self._deny(raw_sock, "404 Not Found")
-				raw_sock.close()
-				raise OSError("host header rejected")
+				return _decoy_or_deny("404 Not Found", "host header rejected")
 		upgrade = headers.get("upgrade", "").lower()
 		conn_hdr = headers.get("connection", "").lower()
 		if upgrade != "websocket" or "upgrade" not in conn_hdr:
-			self._deny(raw_sock, "400 Bad Request")
-			raw_sock.close()
-			raise OSError("not a ws upgrade")
+			return _decoy_or_deny("400 Bad Request", "not a ws upgrade")
 		key = headers.get("sec-websocket-key")
 		if not key:
 			self._deny(raw_sock, "400 Bad Request")
@@ -2879,6 +2890,83 @@ class WSListener:
 	def close(self):
 		try:
 			self.socket.close()
+		except OSError:
+			pass
+
+	def _proxy_to_backend(self, sock, method, path, headers, body):
+		"""
+		One-shot reverse proxy of a non-WS HTTP request to self.backend_url.
+		Buffered (no streaming) — decoy backends are expected to serve small
+		pages. Response body is capped at 10 MiB to prevent memory blow-up
+		if an operator pointed the decoy at something huge.
+		"""
+		MAX_RESP = 10 * 1024 * 1024
+		# forward request body if any
+		cl = 0
+		try:
+			cl = int(headers.get("content-length", "0") or 0)
+		except ValueError:
+			cl = 0
+		body_bytes = bytes(body or b"")
+		if cl > len(body_bytes):
+			need = cl - len(body_bytes)
+			while need > 0:
+				chunk = sock.recv(min(need, 65536))
+				if not chunk:
+					break
+				body_bytes += chunk
+				need -= len(chunk)
+		# hop-by-hop headers per RFC 7230 6.1 plus Host (we set it ourselves)
+		# and framing headers that urllib will regenerate
+		HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
+		              "proxy-authorization", "te", "trailers",
+		              "transfer-encoding", "upgrade", "host", "content-length",
+		              "sec-websocket-key", "sec-websocket-version",
+		              "sec-websocket-protocol", "sec-websocket-extensions",
+		              "sec-websocket-accept"}
+		req_headers = {}
+		for k, v in headers.items():
+			if k.lower() in HOP_BY_HOP:
+				continue
+			req_headers[k] = v
+		url = self.backend_url.rstrip("/") + path
+		try:
+			parsed = urlsplit(url)
+		except ValueError:
+			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		req_headers["Host"] = parsed.netloc
+		req = Request(url, data=body_bytes if body_bytes else None,
+		              method=method, headers=req_headers)
+		try:
+			resp = urlopen(req, timeout=15)
+			status = resp.status
+			reason = resp.reason or ""
+			resp_headers = resp.headers
+			resp_body = resp.read(MAX_RESP + 1)
+		except HTTPError as e:
+			status = e.code
+			reason = e.reason or ""
+			resp_headers = e.headers
+			resp_body = e.read(MAX_RESP + 1)
+		except (URLError, OSError) as e:
+			logger.debug("ws-backend unreachable: %s" % e)
+			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		if len(resp_body) > MAX_RESP:
+			resp_body = resp_body[:MAX_RESP]
+		# build response
+		reply = bytearray()
+		reply.extend(("HTTP/1.1 %d %s\r\n" % (status, reason)).encode("ascii"))
+		for k, v in resp_headers.items():
+			if k.lower() in HOP_BY_HOP:
+				continue
+			reply.extend(("%s: %s\r\n" % (k, v)).encode("iso-8859-1"))
+		reply.extend(("Content-Length: %d\r\n" % len(resp_body)).encode("ascii"))
+		reply.extend(b"Connection: close\r\n\r\n")
+		reply.extend(resp_body)
+		try:
+			sock.sendall(bytes(reply))
 		except OSError:
 			pass
 
@@ -7457,6 +7545,7 @@ class Options:
 		self.ws = False
 		self.ws_path = '/'
 		self.ws_host = ''
+		self.ws_backend = ''
 		self.tls_cert = ''
 		self.tls_key = ''
 		self.no_bins = ''
@@ -7594,6 +7683,7 @@ def main():
 	ws.add_argument("--ws", help="Accept reverse shells over HTTP(S)+WebSocket instead of raw TCP", action="store_true")
 	ws.add_argument("--ws-path", help="URL path where the upgrade is accepted (default: /)", type=str, metavar='')
 	ws.add_argument("--ws-host", help="Optional Host: header allow-regex (default: accept any, needed for domain fronting)", type=str, metavar='')
+	ws.add_argument("--ws-backend", help="Decoy reverse-proxy URL for non-WS requests (hides the listener behind a plausible website)", type=str, metavar='')
 	ws.add_argument("--tls-cert", help="PEM certificate for TLS termination (enables wss://)", type=str, metavar='')
 	ws.add_argument("--tls-key", help="PEM private key matching --tls-cert", type=str, metavar='')
 
@@ -7737,6 +7827,7 @@ def main():
 						path=options.ws_path or '/',
 						host_pattern=ws_host_pattern,
 						tls_ctx=tls_ctx,
+						backend_url=options.ws_backend or None,
 					)
 				except OSError as e:
 					logger.error(f"Failed to bind WSListener: {e}")
