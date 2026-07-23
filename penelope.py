@@ -2096,6 +2096,24 @@ class Core:
 					logger.debug(f"New thread: {thread_name}")
 					threading.Thread(target=Session, args=(_socket, *endpoint, readable), name=thread_name).start()
 
+				# WebSocket listeners: accept the TCP conn here, hand off to a
+				# per-connection thread that runs the TLS+WS handshake before
+				# constructing the Session
+				elif readable.__class__ is WSListener:
+					try:
+						_socket, endpoint = readable.socket.accept()
+					except BlockingIOError:
+						continue
+					except OSError:
+						continue
+					if sum(1 for s in tuple(self.sessions.values()) if s.ip == endpoint[0]) >= options.max_sessions:
+						_socket.close()
+						logger.debug(f"Rejected {endpoint}: max sessions per host ({options.max_sessions}) reached")
+						continue
+					thread_name = f"NewWSCon{endpoint}"
+					logger.debug(f"New thread: {thread_name}")
+					threading.Thread(target=readable._handoff, args=(_socket, endpoint), name=thread_name).start()
+
 				# STDIN
 				elif readable is sys.stdin:
 					if self.attached_session:
@@ -2182,6 +2200,13 @@ class Core:
 						readable.shell_response_buf.seek(0)
 						readable.shell_response_buf.truncate(0)
 
+					# WS control frames (PONG for a received PING, CLOSE reply) were
+					# queued during recv(). Force the session into wlist so we flush
+					# them even if the shell hasn't produced any output to send.
+					if isinstance(readable.socket, WebSocketConn) and readable.socket.has_pending_ctrl():
+						if readable not in self.wlist:
+							self.wlist.append(readable)
+
 			for writable in writables:
 				with writable.wlock:
 					try:
@@ -2200,7 +2225,13 @@ class Core:
 					writable.outbuf.truncate()
 					writable.outbuf.write(remaining)
 					if not remaining:
-						self.wlist.remove(writable)
+						# keep WS sessions in wlist if a control-frame reply is still
+						# owed to the peer (PONG / CLOSE ack) — has_pending_ctrl()
+						# won't produce shell output on its own to trigger a re-add
+						if isinstance(writable.socket, WebSocketConn) and writable.socket.has_pending_ctrl():
+							pass
+						else:
+							self.wlist.remove(writable)
 
 	def stop(self):
 		options.maintain = 0
@@ -2709,14 +2740,58 @@ class WSListener:
 		self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 		self.socket.bind((host, port))
 		self.socket.listen(5)
+		self.socket.setblocking(False)
 		# remember what port the OS picked when port was 0
 		self.host, self.port = self.socket.getsockname()
 
 	def __str__(self):
-		return f"WSListener({self.host}:{self.port}{self.path})"
+		scheme = "wss" if self.tls_ctx else "ws"
+		return f"WSListener({scheme}://{self.host}:{self.port}{self.path})"
+
+	def __bool__(self):
+		return hasattr(self, 'id')
 
 	def fileno(self):
 		return self.socket.fileno()
+
+	def start(self):
+		scheme = "wss" if self.tls_ctx else "ws"
+		specific = ""
+		if self.host == '0.0.0.0':
+			specific = paint('-> ').cyan + str(paint(' • ').cyan).join([str(paint(ip).cyan) for ip in Interfaces().ips])
+		logger.info(
+			f"Listening for {scheme.upper()} reverse shells on "
+			f"{paint(self.host).blue}{paint(':').white}{paint(self.port).orange}"
+			f"{paint(self.path).cyan} {specific}"
+		)
+		self.id = core.new_listenerID
+		core.rlist.append(self)
+		core.listeners[self.id] = self
+		if not core.started:
+			core.start()
+		core.control << None
+
+	def stop(self):
+		if threading.current_thread().name != 'Core':
+			core.control << (lambda: core.listeners[self.id].stop())
+			return
+		core.rlist.remove(self)
+		del core.listeners[self.id]
+		try:
+			self.socket.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+		self.socket.close()
+		logger.warning(f"Stopping {self}")
+
+	def _handoff(self, raw_sock, endpoint):
+		# runs in a per-connection thread: TLS + WS handshake + Session
+		try:
+			conn = self.accept_ws(raw_sock, endpoint)
+		except OSError as e:
+			logger.debug(f"WS handshake failed for {endpoint}: {e}")
+			return
+		Session(conn, endpoint[0], endpoint[1], self)
 
 	def _deny(self, sock, status, body=b""):
 		try:
@@ -2806,6 +2881,11 @@ class WSListener:
 			self.socket.close()
 		except OSError:
 			pass
+
+	def payloads(self, interface_filter=None):
+		# WS-specific payload templates land with commit 5; keep the Core
+		# path (options.payloads) happy in the meantime with an empty return.
+		return ""
 
 class Session:
 
@@ -3428,14 +3508,22 @@ class Session:
 			if not self in core.rlist:
 				return False
 
+			# WS transport: frame outbound bytes as one BINARY frame so the
+			# peer's WS decoder can read them. Raw TCP passes through as-is.
+			# Return the caller's byte count either way so upload/exec/etc.
+			# don't get confused by frame-header overhead.
+			_input_len = len(data)
+			if isinstance(self.socket, WebSocketConn):
+				data = WebSocketConn.frame(data)
+
 			self.outbuf.seek(0, io.SEEK_END)
-			_len = self.outbuf.write(data)
+			self.outbuf.write(data)
 
 			if self not in core.wlist:
 				core.wlist.append(self)
 				if not stdin:
 					core.control << None
-			return _len
+			return _input_len
 
 	def record(self, data, _input=False):
 		self.last_lines << data
@@ -7366,6 +7454,11 @@ class Options:
 		self.mcp_host = ''
 		self.mcp_port = 0
 		self.mcp_token = ''
+		self.ws = False
+		self.ws_path = '/'
+		self.ws_host = ''
+		self.tls_cert = ''
+		self.tls_key = ''
 		self.no_bins = ''
 
 	def __getattribute__(self, option):
@@ -7497,6 +7590,13 @@ def main():
 	mcp.add_argument("--mcp-port", help="Port to bind (default: saved port, else a random free port persisted to ~/.penelope/mcp.json)", type=int, metavar='')
 	mcp.add_argument("--mcp-token", help="Bearer token (default: saved token, else auto-generated and persisted)", type=str, metavar='')
 
+	ws = parser.add_argument_group("WebSocket listener")
+	ws.add_argument("--ws", help="Accept reverse shells over HTTP(S)+WebSocket instead of raw TCP", action="store_true")
+	ws.add_argument("--ws-path", help="URL path where the upgrade is accepted (default: /)", type=str, metavar='')
+	ws.add_argument("--ws-host", help="Optional Host: header allow-regex (default: accept any, needed for domain fronting)", type=str, metavar='')
+	ws.add_argument("--tls-cert", help="PEM certificate for TLS termination (enables wss://)", type=str, metavar='')
+	ws.add_argument("--tls-key", help="PEM private key matching --tls-cert", type=str, metavar='')
+
 	fileserver = parser.add_argument_group("File server")
 	fileserver.add_argument("-s", "--serve", help="Run HTTP file server mode", action="store_true")
 	fileserver.add_argument("-prefix", "--url-prefix", help="URL path prefix", type=str, metavar='')
@@ -7611,8 +7711,39 @@ def main():
 
 	# Reverse Listeners
 	else:
+		# Build an ssl.SSLContext once if --tls-cert/--tls-key are set; the
+		# same context is shared across every WSListener the CLI spawns.
+		tls_ctx = None
+		if options.ws and (options.tls_cert or options.tls_key):
+			if not (options.tls_cert and options.tls_key):
+				logger.error("--tls-cert and --tls-key must be provided together")
+				sys.exit(1)
+			try:
+				tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+				tls_ctx.load_cert_chain(certfile=options.tls_cert, keyfile=options.tls_key)
+			except (ssl.SSLError, OSError) as e:
+				logger.error(f"TLS setup failed: {e}")
+				sys.exit(1)
+
+		ws_host_pattern = re.compile(options.ws_host) if options.ws and options.ws_host else None
+
 		for port in options.ports:
-			TCPListener(host=options.interface, port=port, jump=options.jump)
+			if options.ws:
+				host = Interfaces().translate(options.interface or options.default_interface)
+				try:
+					listener = WSListener(
+						host=host,
+						port=int(port or options.default_listener_port),
+						path=options.ws_path or '/',
+						host_pattern=ws_host_pattern,
+						tls_ctx=tls_ctx,
+					)
+				except OSError as e:
+					logger.error(f"Failed to bind WSListener: {e}")
+					continue
+				listener.start()
+			else:
+				TCPListener(host=options.interface, port=port, jump=options.jump)
 			if not core.listeners:
 				sys.exit(1)
 
