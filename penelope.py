@@ -2482,6 +2482,177 @@ class Channel:
 		os.close(self._read)
 		os.close(self._write)
 
+# ---- WebSocket transport (RFC 6455) ------------------------------------------
+# WS_OP_* opcodes and WS_MAX_FRAME_PAYLOAD cap are used by WebSocketConn
+# below and by the WSListener that will consume it in a follow-up commit.
+WS_OP_CONT   = 0x0
+WS_OP_TEXT   = 0x1
+WS_OP_BINARY = 0x2
+WS_OP_CLOSE  = 0x8
+WS_OP_PING   = 0x9
+WS_OP_PONG   = 0xA
+
+# Cap inbound frame payloads. 64 KiB pre-Session mirrors chisel's default
+# CHISEL_WS_READ_LIMIT and is well above SSH's ~35 KiB max packet, so it is
+# large enough for our Messenger TLV frames yet small enough to prevent a
+# pre-auth peer from exhausting memory with an oversized length header.
+WS_MAX_FRAME_PAYLOAD = 64 * 1024
+
+class WebSocketConn:
+	"""
+	Non-blocking adapter around a raw socket that speaks RFC 6455.
+
+	Sits between a TCP socket (or SSL-wrapped socket) and Session so that
+	Session sees an ordinary socket-like object. The Messenger TLV runs
+	inside the WS binary frames just like it runs over raw TCP.
+
+	Contract:
+	  - recv(n) returns decoded application bytes. Ignores `n` as an upper
+	    bound and drains all currently-decoded payload in one call: fileno()
+	    reflects only TCP-readability, so buffering the leftover would
+	    strand it until the next TCP event fires, which Core cannot know to
+	    break out of. Payload sizes are capped by WS_MAX_FRAME_PAYLOAD.
+	  - recv(n) raises BlockingIOError when the frame is still incomplete,
+	    and returns b"" iff the peer sent CLOSE (or TCP closed abnormally).
+	  - send(data) prepends any queued control-frame bytes (PONG replies,
+	    CLOSE reply) and TCP-sends. Returns the number of caller bytes
+	    accepted so Session.outbuf drains correctly. BlockingIOError iff
+	    TCP would block while control bytes are still pending.
+	  - frame(data, opcode=BINARY) builds one unmasked FIN=1 frame; server
+	    -to-client MUST NOT mask (RFC 6455 5.1). Session.send() wraps its
+	    outbound bytes with this before writing to outbuf.
+	  - has_pending_ctrl() lets Core add the Session to wlist even when
+	    outbuf is empty so PONG/CLOSE replies do not stall waiting for the
+	    next byte of shell output.
+	"""
+
+	def __init__(self, sock):
+		self._sock = sock
+		self._rbuf = bytearray()     # partial-frame TCP bytes waiting to parse
+		self._payload = bytearray()  # decoded app bytes waiting for recv()
+		self._ctrl_out = bytearray() # framed PONG/CLOSE bytes queued to send
+		self._peer_closed = False
+		self._cont_opcode = None     # in-flight fragmented message opcode
+
+	# socket look-alikes: delegated to the underlying socket
+	def fileno(self):        return self._sock.fileno()
+	def setsockopt(self, *a, **kw): return self._sock.setsockopt(*a, **kw)
+	def setblocking(self, f): return self._sock.setblocking(f)
+	def getpeername(self):    return self._sock.getpeername()
+	def getsockname(self):    return self._sock.getsockname()
+	def close(self):
+		try:
+			self._sock.close()
+		except OSError:
+			pass
+
+	@staticmethod
+	def frame(data, opcode=WS_OP_BINARY):
+		b1 = 0x80 | (opcode & 0x0F)
+		n = len(data)
+		if n < 126:
+			return struct.pack("!BB", b1, n) + data
+		if n < (1 << 16):
+			return struct.pack("!BBH", b1, 126, n) + data
+		return struct.pack("!BBQ", b1, 127, n) + data
+
+	def has_pending_ctrl(self):
+		return bool(self._ctrl_out)
+
+	def _queue_ctrl(self, opcode, payload=b""):
+		self._ctrl_out.extend(self.frame(payload, opcode))
+
+	def _try_parse(self):
+		buf = self._rbuf
+		if len(buf) < 2:
+			return None
+		b1, b2 = buf[0], buf[1]
+		fin  = (b1 & 0x80) != 0
+		rsv  = (b1 & 0x70)
+		op   = b1 & 0x0F
+		mask = (b2 & 0x80) != 0
+		ln   = b2 & 0x7F
+		if rsv:
+			raise OSError("ws: reserved bits set")
+		if not mask:
+			raise OSError("ws: client frame not masked")
+		off = 2
+		if ln == 126:
+			if len(buf) < off + 2:
+				return None
+			ln, = struct.unpack_from("!H", buf, off); off += 2
+		elif ln == 127:
+			if len(buf) < off + 8:
+				return None
+			ln, = struct.unpack_from("!Q", buf, off); off += 8
+		if ln > WS_MAX_FRAME_PAYLOAD:
+			raise OSError("ws: frame too large (%d > %d)" % (ln, WS_MAX_FRAME_PAYLOAD))
+		if len(buf) < off + 4 + ln:
+			return None
+		mkey = bytes(buf[off:off + 4]); off += 4
+		raw = bytes(buf[off:off + ln])
+		payload = bytes(b ^ mkey[i & 3] for i, b in enumerate(raw)) if ln else b""
+		del buf[:off + ln]
+		if op & 0x8:  # control frame
+			if not fin:
+				raise OSError("ws: fragmented control frame")
+			if ln > 125:
+				raise OSError("ws: oversized control frame")
+		return fin, op, payload
+
+	def recv(self, n):
+		if self._peer_closed and not self._payload:
+			return b""
+		if not self._payload:
+			data = self._sock.recv(options.network_buffer_size)
+			if not data:
+				return b""
+			self._rbuf.extend(data)
+			while True:
+				parsed = self._try_parse()
+				if parsed is None:
+					break
+				fin, op, payload = parsed
+				if op == WS_OP_PING:
+					self._queue_ctrl(WS_OP_PONG, payload)
+				elif op == WS_OP_PONG:
+					pass
+				elif op == WS_OP_CLOSE:
+					self._queue_ctrl(WS_OP_CLOSE, payload[:2] if len(payload) >= 2 else b"")
+					self._peer_closed = True
+					break
+				elif op == WS_OP_CONT:
+					if self._cont_opcode is None:
+						raise OSError("ws: continuation without start")
+					self._payload.extend(payload)
+					if fin:
+						self._cont_opcode = None
+				elif op in (WS_OP_TEXT, WS_OP_BINARY):
+					if self._cont_opcode is not None:
+						raise OSError("ws: new message while continuation in flight")
+					self._payload.extend(payload)
+					if not fin:
+						self._cont_opcode = op
+				else:
+					raise OSError("ws: bad opcode 0x%x" % op)
+		if self._payload:
+			chunk = bytes(self._payload)
+			self._payload.clear()
+			return chunk
+		if self._peer_closed:
+			return b""
+		raise BlockingIOError
+
+	def send(self, data):
+		out = bytes(self._ctrl_out) + data
+		sent = self._sock.send(out)
+		ctrl_len = len(self._ctrl_out)
+		if sent <= ctrl_len:
+			del self._ctrl_out[:sent]
+			raise BlockingIOError
+		self._ctrl_out.clear()
+		return sent - ctrl_len
+
 class Session:
 
 	def __init__(self, _socket, target, port, listener=None):
