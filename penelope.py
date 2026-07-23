@@ -32,6 +32,7 @@ import shlex
 import queue
 import codecs
 import struct
+import hashlib
 import shutil
 import atexit
 import socket
@@ -2652,6 +2653,159 @@ class WebSocketConn:
 			raise BlockingIOError
 		self._ctrl_out.clear()
 		return sent - ctrl_len
+
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def _ws_sec_accept(client_key):
+	# RFC 6455 4.2.2: base64(sha1(key + magic guid))
+	digest = hashlib.sha1(client_key.encode("ascii") + WS_GUID).digest()
+	return base64.b64encode(digest).decode("ascii")
+
+def _ws_read_request(sock, max_bytes=8192):
+	# Read one HTTP/1.1 request head from a blocking socket. Bounded to
+	# max_bytes so a slowloris cannot exhaust memory before the upgrade.
+	# Returns (method, path, headers-dict, leftover-bytes) or raises OSError.
+	buf = bytearray()
+	while b"\r\n\r\n" not in buf:
+		chunk = sock.recv(1024)
+		if not chunk:
+			raise OSError("closed during handshake")
+		buf.extend(chunk)
+		if len(buf) > max_bytes:
+			raise OSError("handshake headers too large")
+	end = buf.find(b"\r\n\r\n")
+	head = bytes(buf[:end]).decode("iso-8859-1", errors="replace")
+	lines = head.split("\r\n")
+	parts = lines[0].split(" ", 2)
+	if len(parts) < 3:
+		raise OSError("bad request line")
+	method, path, _ = parts
+	headers = {}
+	for line in lines[1:]:
+		if ":" not in line:
+			continue
+		k, v = line.split(":", 1)
+		headers[k.strip().lower()] = v.strip()
+	leftover = bytes(buf[end + 4:])
+	return method, path, headers, leftover
+
+class WSListener:
+	"""
+	HTTP+WebSocket listener. Accepts an upgrade at `path`, does the RFC
+	6455 handshake, and returns a WebSocketConn ready for Session use.
+
+	Wiring into Core (and the CLI --ws flag) lands in follow-up commits.
+	This commit only introduces the class so it can be unit-tested and
+	referenced by the wiring commit.
+	"""
+
+	def __init__(self, host, port, path="/", host_pattern=None, tls_ctx=None):
+		self.host = host
+		self.port = port
+		self.path = path
+		self.host_pattern = host_pattern  # None or a compiled re.Pattern
+		self.tls_ctx = tls_ctx            # None or an ssl.SSLContext
+		self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		self.socket.bind((host, port))
+		self.socket.listen(5)
+		# remember what port the OS picked when port was 0
+		self.host, self.port = self.socket.getsockname()
+
+	def __str__(self):
+		return f"WSListener({self.host}:{self.port}{self.path})"
+
+	def fileno(self):
+		return self.socket.fileno()
+
+	def _deny(self, sock, status, body=b""):
+		try:
+			sock.sendall(
+				("HTTP/1.1 " + status + "\r\n"
+				 "Content-Length: " + str(len(body)) + "\r\n"
+				 "Connection: close\r\n\r\n").encode("ascii") + body
+			)
+		except OSError:
+			pass
+
+	def accept_ws(self, raw_sock, peer_addr=None, timeout=10.0):
+		"""
+		Blocking WS handshake on an already-accepted raw socket. Returns a
+		WebSocketConn ready for non-blocking Session use, or raises OSError.
+		On any handshake failure this sends a short HTTP error and closes
+		the socket. TLS is wrapped first if tls_ctx was configured.
+		"""
+		raw_sock.settimeout(timeout)
+		if self.tls_ctx is not None:
+			try:
+				raw_sock = self.tls_ctx.wrap_socket(raw_sock, server_side=True)
+			except (ssl.SSLError, OSError) as e:
+				try:
+					raw_sock.close()
+				except OSError:
+					pass
+				raise OSError("tls handshake failed: %s" % e)
+		try:
+			method, path, headers, leftover = _ws_read_request(raw_sock)
+		except OSError:
+			try:
+				raw_sock.close()
+			except OSError:
+				pass
+			raise
+		if method != "GET":
+			self._deny(raw_sock, "405 Method Not Allowed")
+			raw_sock.close()
+			raise OSError("bad method %s" % method)
+		if path != self.path:
+			self._deny(raw_sock, "404 Not Found")
+			raw_sock.close()
+			raise OSError("path mismatch %s" % path)
+		if self.host_pattern is not None:
+			if not self.host_pattern.match(headers.get("host", "")):
+				self._deny(raw_sock, "404 Not Found")
+				raw_sock.close()
+				raise OSError("host header rejected")
+		upgrade = headers.get("upgrade", "").lower()
+		conn_hdr = headers.get("connection", "").lower()
+		if upgrade != "websocket" or "upgrade" not in conn_hdr:
+			self._deny(raw_sock, "400 Bad Request")
+			raw_sock.close()
+			raise OSError("not a ws upgrade")
+		key = headers.get("sec-websocket-key")
+		if not key:
+			self._deny(raw_sock, "400 Bad Request")
+			raw_sock.close()
+			raise OSError("missing sec-websocket-key")
+		if headers.get("sec-websocket-version") != "13":
+			self._deny(raw_sock, "400 Bad Request")
+			raw_sock.close()
+			raise OSError("unsupported ws version")
+		accept = _ws_sec_accept(key)
+		resp = (
+			"HTTP/1.1 101 Switching Protocols\r\n"
+			"Upgrade: websocket\r\n"
+			"Connection: Upgrade\r\n"
+			"Sec-WebSocket-Accept: " + accept + "\r\n"
+			"\r\n"
+		).encode("ascii")
+		try:
+			raw_sock.sendall(resp)
+		except OSError as e:
+			raw_sock.close()
+			raise OSError("failed to send 101: %s" % e)
+		raw_sock.setblocking(False)
+		ws = WebSocketConn(raw_sock)
+		if leftover:
+			# client bytes that piggy-backed on the handshake
+			ws._rbuf.extend(leftover)
+		return ws
+
+	def close(self):
+		try:
+			self.socket.close()
+		except OSError:
+			pass
 
 class Session:
 
