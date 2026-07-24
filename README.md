@@ -19,6 +19,7 @@ Penelope is a modern shell handler for penetration testers and CTF players. It p
   - 🧩 [Modules](#modules)
 - 💻 [Usage](#usage)
   - ▶️ [Typical Usage](#typical-usage)
+  - 🌐 [WebSocket Listener](#websocket-listener---ws)
   - 🎬 [Example Workflow](#example-workflow)
   - 🖲️ [Main Menu Commands](#main-menu-commands)
   - ⚡ [Command Line Options](#command-line-options)
@@ -79,6 +80,7 @@ pipx install penelope-shell-handler
 - Can be imported by Python exploits to handle shells in the same terminal (see [extras/exploit_examples](https://github.com/brightio/penelope/tree/main/extras/exploit_examples))
 - Can be used with Metasploit exploits by disabling the default handler with `set DisablePayloadHandler True`
 - Expose live sessions to an MCP client like Claude Code with the `--mcp` switch (local HTTP, token-authenticated), driving the same shells alongside you
+- Accept reverse shells over HTTP(S)+WebSocket with `--ws` — friendly to CDN/redirector fronting and to environments where only `80/443` egress is allowed
 
 ### Modules
 
@@ -122,6 +124,42 @@ penelope -s -u -ud /tmp/loot         # Upload mode, store received files in /tmp
 
 On start, Penelope prints a ready-to-use link per interface (and an upload hint
 when `-u` is set), so you can copy-paste straight into the target shell.
+
+### WebSocket Listener (`--ws`)
+
+`--ws` swaps the default raw-TCP listener for one that accepts reverse shells
+over an HTTP(S) `Upgrade: websocket` handshake. Same `--interface` / `--port`
+selection as the plain listener — everything past the handshake (auto-PTY,
+uploads/downloads, `run`, modules, MCP) works unchanged because a `Messenger`
+TLV stream just rides inside WS binary frames.
+
+```bash
+penelope --ws                              # accept ws:// upgrades on 0.0.0.0:4444
+penelope --ws -p 8443                      # ...on 0.0.0.0:8443
+penelope --ws --ws-path /xk9               # only accept upgrades at /xk9
+penelope --ws --tls-cert cert.pem --tls-key key.pem     # wss:// via a real cert
+penelope --ws --ws-backend https://example.com          # decoy: non-WS requests get proxied
+penelope --ws --ws-host '^front\.example\.com$'         # optional Host: allow-regex
+penelope --ws -a                            # also print a pastable Python one-liner
+```
+
+- **Host header**: not enforced by default — this is what lets domain-fronting
+  work (the CDN or redirector rewrites `Host` on your behalf). Use `--ws-host`
+  to lock the listener to a specific expected value once fronting is stable.
+- **Decoy backend** (`--ws-backend URL`): any request that isn't a well-formed
+  WS upgrade at the expected path is transparently reverse-proxied to `URL`, so
+  a scanner hitting the port sees a plausible web page instead of a
+  self-identifying 404. Same idea as chisel's `--backend`.
+- **TLS**: bring-your-own certificate (`--tls-cert` + `--tls-key`). When the
+  listener sits behind a CDN or a redirector that terminates TLS itself,
+  plain `--ws` is fine and often the right call — one less certificate to
+  manage on the origin.
+- **Fronting deployment**: point a fronting redirector (e.g. one running on a
+  cloud runtime that shares infrastructure with a large provider domain) at
+  your Penelope host as its backend; the target-side payload connects to the
+  fronting domain with a `Host:` header naming your redirector, and the
+  provider's edge routes to it based on Host — the outer TLS SNI need not
+  match the actual backend. Penelope accepts whatever `Host` arrives.
 
 ### Example Workflow
 
@@ -186,6 +224,14 @@ MCP:
   --mcp-port                    Port to bind (default: saved port, else a random free port persisted to ~/.penelope/mcp.json)
   --mcp-token                   Bearer token (default: saved token, else auto-generated and persisted)
 
+WebSocket listener:
+  --ws                          Accept reverse shells over HTTP(S)+WebSocket instead of raw TCP
+  --ws-path                     URL path where the upgrade is accepted (default: /)
+  --ws-host                     Optional Host: header allow-regex (default: accept any, needed for domain fronting)
+  --ws-backend                  Decoy reverse-proxy URL for non-WS requests (hides the listener behind a plausible website)
+  --tls-cert                    PEM certificate for TLS termination (enables wss://)
+  --tls-key                     PEM private key matching --tls-cert
+
 File server:
   -s, --serve                   Run HTTP file server mode
   -prefix, --url-prefix         URL path prefix
@@ -207,6 +253,8 @@ Penelope is designed to provide direct and flexible interaction with remote shel
 - **Terminal escape sequences:** Penelope forwards terminal output from remote systems directly to your terminal emulator. Malicious remote processes may use terminal escape sequences to manipulate the screen, create misleading links, or interact with features such as the clipboard. This exposure is inherent to any tool that relays a remote shell to the local terminal (like SSH, telnet, netcat) and is not specific to Penelope. Use a terminal with appropriate security settings when connecting to untrusted systems.
 
 - **Session logs:** Session logs may contain credentials, tokens, commands and other sensitive information received from the target. Store them securely and use `--no-log` when logging is not required.
+
+- **WebSocket listener (`--ws`):** the listener accepts any `Host:` header by default (so fronting works). If a fronting/redirector layer sits in front of Penelope, prefer letting it terminate TLS and pass either HTTP or HTTPS to Penelope, rather than exposing the origin certificate publicly. Combine with `--ws-backend` to serve a plausible decoy on non-WS requests — an origin that answers `404 Not Found` to every path is a strong signal to internet scanners.
 
 - **Unencrypted connections:** Standard reverse and bind shell connections are not encrypted. Avoid using them over untrusted networks unless the traffic is protected by a secure tunnel or VPN.
 

