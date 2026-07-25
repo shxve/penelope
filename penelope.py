@@ -4499,7 +4499,8 @@ class Session:
 		stdout(bytes(self.last_lines))
 
 		if self.type == 'PTY':
-			tty.setraw(sys.stdin)
+			if sys.stdin.isatty():
+				tty.setraw(sys.stdin)
 			os.kill(os.getpid(), signal.SIGWINCH)
 
 		elif self.type == 'Readline':
@@ -7528,6 +7529,8 @@ def check_urls():
 
 def listener_menu():
 	if not core.listeners:
+		return False
+	if not sys.stdin.isatty():
 		return False
 
 	listener_menu.active = True
