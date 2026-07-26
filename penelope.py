@@ -2149,7 +2149,7 @@ class Core:
 						data = readable.socket.recv(options.network_buffer_size)
 						if not data:
 							raise OSError
-					except BlockingIOError:
+					except (BlockingIOError, ssl.SSLWantReadError):
 						continue
 					except OSError:
 						logger.debug("Died while reading")
