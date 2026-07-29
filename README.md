@@ -9,7 +9,7 @@
 ![MEA](https://img.shields.io/badge/MEA%202025-15803D)<br>
 ![Kali Linux](https://img.shields.io/badge/Packaged%20in-Kali%20Linux-557C94)
 
-Penelope is a modern shell handler for penetration testers and CTF players. It provides a more capable alternative to basic netcat listeners, adding automatic PTY upgrades, session management, logging, file transfers and helper modules.
+Penelope is a modern shell handler for penetration testers and CTF players. It provides a more capable alternative to basic netcat listeners, adding **WebSocket TLS and non-TLS listeners and python payload generation**, automatic PTY upgrades, session management, logging, file transfers and helper modules.
 
 ## Table of Contents
 - 📥 [Installation](#installation)
