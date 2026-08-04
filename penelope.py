@@ -3192,6 +3192,7 @@ class Session:
 					else:
 						self.hostname = target
 
+				self.hostname = sanitize_meta(self.hostname)
 				hostname = self.hostname
 				c1 = '~' if hostname else ''
 				ip = self.ip
