@@ -129,3 +129,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Local scratch (not for upstream fork)
+CLAUDE.md
+tasks/
