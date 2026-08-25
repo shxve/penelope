@@ -19,7 +19,9 @@ Penelope is a modern shell handler for penetration testers and CTF players. It p
   - 🧩 [Modules](#modules)
 - 💻 [Usage](#usage)
   - ▶️ [Typical Usage](#typical-usage)
+  - 📂 [HTTP File Server (`-s`)](#http-file-server--s)
   - 🌐 [WebSocket Listener](#websocket-listener---ws)
+  - 🐚 [Reverse Shell Payloads](#reverse-shell-payloads)
   - 🎬 [Example Workflow](#example-workflow)
   - 🖲️ [Main Menu Commands](#main-menu-commands)
   - ⚡ [Command Line Options](#command-line-options)
@@ -83,6 +85,28 @@ pipx install penelope-shell-handler
 - Accept reverse shells over HTTP(S)+WebSocket with `--ws` — friendly to CDN/redirector fronting and to environments where only `80/443` egress is allowed
 
 ### Modules
+
+Modules are shortcuts for the tools you would otherwise download and upload by hand. Type `modules` to list them and `run <module>` to use one. Nothing is bundled with Penelope: each module fetches the tool from its official repository at the moment you run it, so you always get the current version and the download happens on your machine, not on the target.
+
+|Category|Module|What it does|
+|---|---|---|
+|Privilege Escalation|`upload_privesc_scripts`|Upload linpeas, lse, deepce, pspy on Unix, or winpeas, powerup, privesccheck, fullpowers, enablealltokenprivs on Windows|
+||`peass_ng`|Run the latest PEASS-ng in the background|
+||`lse`|Run the latest linux-smart-enumeration in the background|
+||`linuxexploitsuggester`|Run the latest linux-exploit-suggester in the background|
+||`traitor`|Upload Traitor|
+||`upload_local_exploits`|Upload DirtyFrag and DirtyPipe|
+||`upload_potato`|Upload GodPotato, SigmaPotato, PrintSpoofer|
+|Credential Dumping|`upload_credump_scripts`|Upload Mimikatz, LaZagne, Snaffler, SharpWeb|
+|Active Directory|`upload_ad_scripts`|Upload PowerView, SharpHound, GhostPack, adPEAS|
+|Pivoting|`ligolo`|Upload the Ligolo-ng agent|
+||`chisel`|Upload Chisel|
+||`ngrok`|Set up a TCP tunnel through ngrok|
+|Forensics|`uac`|Collect forensic artifacts with Unix-like Artifacts Collector in the background|
+||`linux_procmemdump`|Dump process memory in the background (needs root)|
+|Persistence|`panix`|Upload PANIX|
+|Misc|`meterpreter`|Spawn a Meterpreter session|
+||`cleanup`|Remove the files and directories you uploaded to the target|
 
 ![modules](https://github.com/user-attachments/assets/ff139757-ea4b-487d-8e81-e84baf911093)
 
@@ -161,6 +185,23 @@ penelope --ws -a                            # also print a pastable Python one-l
   provider's edge routes to it based on Host — the outer TLS SNI need not
   match the actual backend. Penelope accepts whatever `Host` arrives.
 
+### Reverse Shell Payloads
+Penelope prints ready-to-paste reverse shell commands pointing back at its own Listeners, so you don't have to look them up elsewhere and fill in the IP and port by hand. There are two ways to get them:
+
+```bash
+penelope -a                          # Print every payload for each Listener as it starts
+```
+
+From the Main Menu, `payloads` prints them at any time, and unlike `-a` it narrows the list first. It asks which Listener the payloads should point at, and whether the target runs Linux or Windows, so you only get the ones that can actually run there. Answer `*` for every Listener and `both` for every payload:
+
+|Target|Payloads|
+|---|---|
+|Linux|Bash TCP, Netcat with a named pipe, Python3, Perl, PHP, Ruby, Msfvenom ELF|
+|Windows|PowerShell, Msfvenom EXE|
+|Both|Metasploit `generic/shell_reverse_tcp` settings|
+
+The payloads that run on the target are base64 encoded, so the quoting survives whatever mangles it on the way in, and the PowerShell one runs with `-nop -w hidden`. The Msfvenom lines are printed as they are, since those run on your machine to build the file rather than on the target.
+
 ### Example Workflow
 
 As shown in the video below, within only a few seconds we can:
@@ -180,6 +221,39 @@ https://github.com/brightio/penelope/assets/65655412/7295da32-28e2-4c92-971f-094
 Notes:
 - By default you need to press `F12` to detach the PTY shell and go to the Main Menu. If the upgrade was not possible and you ended up with a basic shell, you can detach it with `Ctrl+C`. This also prevents the accidental killing of the shell.
 - The Main Menu supports TAB completion and also short commands. For example instead of `interact 1` you can just type `i 1`.
+- `help <command>` shows the full usage and examples for any of these.
+
+|Group|Command|What it does|
+|---|---|---|
+|Session Operations|`run`|Run a module (`help run` lists them)|
+||`upload`|Upload local files, folders, or HTTP(S)/FTP URLs to the target|
+||`download`|Download files and folders from the target|
+||`open`|Download a remote file or folder and open it with your local default application|
+||`script`|Run a local or remote script in memory and download its output in real time|
+||`exec`|Execute a command on the target and print its output|
+||`spawn`|Spawn another shell from the selected target|
+||`maintain`|Keep N active shells per target, respawning them when they die|
+||`upgrade`|Upgrade the session's shell to PTY (automatic by default, disable with `-U`)|
+||`portfwd`|Forward a local port through the session to a host the target can reach|
+|Session Management|`sessions`|List active sessions or interact with one|
+||`use`|Select a session|
+||`interact`|Interact with a session|
+||`kill`|Kill a session|
+||`dir` \| `.`|Open the session's local folder, or Penelope's base folder if no session is selected|
+|Shell Management|`listeners`|Add, stop, or view Listeners|
+||`payloads`|Show reverse shell commands for the active Listeners|
+||`connect`|Connect to a bind shell|
+||`Interfaces`|Show the local network interfaces|
+|Miscellaneous|`help`|Main Menu help, or help for one command|
+||`modules`|Show the available modules|
+||`history`|Show Main Menu history|
+||`cd`|Show or change the session's remote working directory (the one used for transfers)|
+||`lcd`|Show or change Penelope's local working directory|
+||`SET`|Show or set option values|
+||`reload`|Reload the rc file|
+||`reset`|Reset the local terminal|
+||`DEBUG`|Open the debug console|
+||`exit` \| `quit` \| `q` \| `Ctrl+D`|Exit Penelope|
 
 ![Main Menu](https://github.com/user-attachments/assets/a0ba2925-ea7a-4c09-9ed0-8063a7d21b65)
 

@@ -29,6 +29,15 @@ from penelope import WSListener, WebSocketConn, _ws_python_revshell_src  # noqa:
 
 class TestGeneratedWSRevshell(unittest.TestCase):
 
+	def test_listener_payload_contract_filters_windows(self):
+		lst = WSListener(host="127.0.0.1", port=0)
+		try:
+			self.assertEqual("", lst.payloads(target_os="windows"))
+			self.assertIn("Python WebSocket", lst.payloads(target_os="linux"))
+			self.assertIn("Python WebSocket", lst.payloads(target_os="both"))
+		finally:
+			lst.close()
+
 	def test_payload_delivers_shell(self):
 		lst = WSListener(host="127.0.0.1", port=0)
 		results = {"buf": b""}
