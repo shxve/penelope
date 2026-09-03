@@ -5094,10 +5094,17 @@ class Session:
 				except Exception as e:
 					logger.error(e)
 			else:
-				if os.path.isabs(item):
-					items = list(Path('/').glob(item.lstrip('/')))
-				else:
-					items = list(Path().glob(item))
+				try:
+					if os.path.isabs(item):
+						items = list(Path('/').glob(item.lstrip('/')))
+					else:
+						items = list(Path().glob(item))
+				except (ValueError, IndexError, NotImplementedError):
+					# Path.glob() refuses '.', './' and '' outright, and `upload /`
+					# reduces to the empty pattern. The exception differs by version
+					# (IndexError up to 3.12, ValueError from 3.13). They are still
+					# valid paths, so fall through to the existence check below.
+					items = []
 				if items:
 					resolved_items.extend(items)
 				elif os.path.lexists(item):
